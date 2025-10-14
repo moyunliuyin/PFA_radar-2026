@@ -48,6 +48,11 @@ kalman:
   process_noise: 1e-5
   measurement_noise: 1e-1
 
+mot:
+  max_age: 30
+  min_hits: 3
+  iou_threshold: 50.0  # 欧氏距离阈值，根据实际情况调整
+
 blind_zone:
   base_time: 3.0  # 基础预测时间
   offset_time: 1.7  # 时间偏移量(根据上一帧的信道占用数动态调整单点预测时间)
