@@ -1038,7 +1038,18 @@ if __name__ == "__main__":
                         cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
                                     (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
-
+        if hasattr(filter, 'filter') and hasattr(filter.filter, 'tracks'):
+            for track in filter.filter.tracks:
+                if getattr(track, 'is_confirmed', False) and hasattr(track, 'trace'):
+                    for i in range(1, len(track.trace)):
+                        pt1 = (int(track.trace[i-1][0]), int(track.trace[i-1][1]))
+                        pt2 = (int(track.trace[i][0]), int(track.trace[i][1]))
+                        cv2.line(map, pt1, pt2, (0, 128, 255), 2)
+                    # 当前点和ID
+                    x, y = int(track.trace[-1][0]), int(track.trace[-1][1])
+                    cv2.circle(map, (x, y), 8, (0, 255, 0), -1)
+                    cv2.putText(map, f"{track.class_name} ID:{track.track_id}", (x+10, y-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
         te = time.time()
         t_p = te - ts
         print("fps:", 1 / t_p)  # 打印帧率

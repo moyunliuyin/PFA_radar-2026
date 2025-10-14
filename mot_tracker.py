@@ -13,6 +13,7 @@ class Track:
         self.time_since_update = 0  # 自上次更新以来的帧数
         self.is_confirmed = False  # 是否确认的轨迹
         self.class_name = class_name  # 目标类别
+        self.trace = [tuple(initial_detection)]  # 新增：轨迹点列表
         
     def predict(self):
         #预测下一帧位置
@@ -25,6 +26,7 @@ class Track:
         self.kf.update(detection)
         self.hits += 1
         self.time_since_update = 0
+        self.trace.append(tuple(detection))  # 新增：每次更新都记录轨迹点
         
         # 更新类别信息
         if class_name and not self.class_name:
