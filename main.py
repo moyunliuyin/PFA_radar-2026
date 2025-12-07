@@ -18,12 +18,6 @@ from detect_function import YOLOv5Detector
 from RM_serial_py.ser_api import build_send_packet, receive_packet, Radar_decision, \
     build_data_decision, build_data_radar_all
 import yaml
-import sys
-import os
-sys.path.append(os.path.dirname(__file__))
-
-from filters import KalmanFilter, EnhancedKalmanFilter
-from mot_tracker import MOTTracker
 
 with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
     config = yaml.safe_load(f)
@@ -143,47 +137,125 @@ guess_table = {}
 for robot, points in config['blind_zone']['points'].items():
     guess_table[robot] = [tuple(point) for point in points]
 
-class KalmanFilterWrapper:
-    def __init__(self, max_inactive_time):
-        self.filter = MOTTracker(
-            max_age=config['mot']['max_age'],
-            min_hits=config['mot']['min_hits'],
-            iou_threshold=config['mot']['iou_threshold']
-        )
-        self.filters = {}      # 兼容接口，实际MOT只维护轨迹
-        self.last_update = {}
-        self.max_inactive_time = max_inactive_time
 
-    def add_data(self, result0):
-        detections = []
-        class_names = []
-        for detection in result0:
-            if detection.cls in ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7',
-                                 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']:
-                left, top, w, h = detection.xywh
-                x_center = left + w / 2
-                y_center = top + h / 2
-                detections.append((x_center, y_center))
-                class_names.append(detection.cls)
-        # 使用MOT更新
-        active_tracks, track_info = self.filter.update(detections, class_names)
-        # 更新last_update
-        for name, xy in track_info.items():
+class KalmanFilter:
+    def __init__(self, process_noise=1e-5, measurement_noise=1e-1):
+        self.kf = cv2.KalmanFilter(4, 2)
+
+        # 状态转移矩阵 (假设匀速模型)
+        self.kf.transitionMatrix = np.array([
+            [1, 0, 1, 0],
+            [0, 1, 0, 1],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]], dtype=np.float32)
+
+        # 测量矩阵
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]], dtype=np.float32)
+
+        # 过程噪声协方差
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_noise
+
+        # 测量噪声协方差
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
+
+        # 后验误差协方差
+        self.kf.errorCovPost = np.eye(4, dtype=np.float32)
+
+        self.last_measurement = None
+        self.last_update_time = time.time()
+
+    def update(self, measurement):
+        current_time = time.time()
+        dt = current_time - self.last_update_time
+        self.last_update_time = current_time
+
+        # 更新状态转移矩阵的时间参数
+        self.kf.transitionMatrix[0, 2] = dt
+        self.kf.transitionMatrix[1, 3] = dt
+
+        # 预测
+        prediction = self.kf.predict()
+
+        # 更新
+        measurement = np.array([[np.float32(measurement[0])],
+                                [np.float32(measurement[1])]])
+        self.kf.correct(measurement)
+
+        self.last_measurement = measurement
+
+    def get_estimate(self):
+        if self.last_measurement is None:
+            return None
+        state = self.kf.statePost
+        return (state[0, 0], state[1, 0])
+
+
+class EnhancedKalmanFilter(KalmanFilter):
+    def __init__(self,
+                 process_noise=float(config['kalman']['process_noise']),
+                 measurement_noise=float(config['kalman']['measurement_noise'])):
+        super().__init__(process_noise, measurement_noise)
+        # 初始速度估计为0
+        self.kf.statePost = np.array([[0], [0], [0], [0]], dtype=np.float32)
+
+    def update(self, measurement):
+        # 首帧特殊处理
+        if self.last_measurement is None:
+            dx = dy = 0
+        else:
+            dx = measurement[0] - self.last_measurement[0]
+            dy = measurement[1] - self.last_measurement[1]
+            dt = time.time() - self.last_update_time
+            # 动态调整过程噪声
+            dx_val = dx.item() if isinstance(dx, np.ndarray) else dx
+            dy_val = dy.item() if isinstance(dy, np.ndarray) else dy
+            self.kf.processNoiseCov[2, 2] = min(0.5, 0.1 + abs(dx_val) / 10)
+            self.kf.processNoiseCov[3, 3] = min(0.5, 0.1 + abs(dy_val) / 10)
+
+        super().update(measurement)
+
+
+class KalmanFilterWrapper:
+    def __init__(self, max_inactive_time=2.0):
+        self.max_inactive_time = max_inactive_time
+        self.filters = {}  # 存储不同机器人的卡尔曼滤波器
+        self.last_update = {}  # 存储每个机器人的最后更新时间
+
+    def add_data(self, name, x, y, threshold=100000.0):
+        if name not in self.filters:
+            self.filters[name] = EnhancedKalmanFilter()
             self.last_update[name] = time.time()
-        # 兼容接口
-        for name, xy in track_info.items():
-            self.filters[name] = xy
+
+        current_filter = self.filters[name]
+
+        # 异常值检测
+        if current_filter.last_measurement is not None:
+            dx = x - current_filter.last_measurement[0, 0]
+            dy = y - current_filter.last_measurement[1, 0]
+            distance = np.sqrt(dx ** 2 + dy ** 2)
+
+            if distance > threshold:
+                return
+
+        current_filter.update((x, y))
+        self.last_update[name] = time.time()
+        guess_list[name] = False
 
     def filter_data(self, name):
-        # 返回最新坐标
-        return self.filters.get(name, None)
+        if name not in self.filters:
+            return None
+
+        return self.filters[name].get_estimate()
 
     def get_all_data(self):
         filtered_d = {}
         current_time = time.time()
+
         to_remove = []
         for name in list(self.filters.keys()):
-            if current_time - self.last_update.get(name, 0) > self.max_inactive_time:
+            if current_time - self.last_update[name] > self.max_inactive_time:
                 to_remove.append(name)
                 guess_list[name] = True
             else:
@@ -191,9 +263,12 @@ class KalmanFilterWrapper:
                 if estimate is not None:
                     filtered_d[name] = estimate
                 guess_list[name] = False
+
+        # 清理超时的滤波器
         for name in to_remove:
             del self.filters[name]
             del self.last_update[name]
+
         return filtered_d
 
 
@@ -408,7 +483,7 @@ def test_video_capture_get(video_path, loop=True, start_frame=0, playback_speed=
     global camera_image
     try:
         import av
-        # 使用 Windows/NVIDIA 友好的 d3d11va 硝解码
+        # 使用 Windows/NVIDIA 友好的 d3d11va 硬件解码
         #可将 hwaccel 改为 'cuda'或 'nvdec'
         container = av.open(video_path, mode='r', options={'hwaccel': 'd3d11va'})
         stream = next((s for s in container.streams if s.type == 'video'), None)
@@ -833,254 +908,198 @@ img_y = img0.shape[0]
 img_x = img0.shape[1]
 print(img0.shape)
 
-def visualize_results(img, map, track_info):
-    """
-    可视化检测和追踪结果
-    """
-    for track_id, info in track_info.items():
-        position = info['position']
-        class_name = info['class_name']
-        age = info['age']
-        hits = info['hits']
-        color = (0, 255, 0) if class_name[0] == 'R' else (255, 0, 0)
-        cv2.circle(map, (int(position[0]), int(position[1])), 15, color, -1)
-        cv2.putText(map, f"{class_name} ID:{track_id}", (int(position[0]) - 5, int(position[1]) + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(map, f"Age:{age} Hits:{hits}", (int(position[0]) - 5, int(position[1]) + 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-    cv2.imshow("Detection Results", img)
-    cv2.imshow("Tracking Results", map)
-
-def warmup(detector, num_images=10):
-    """
-    模型预热，批量检测图片以初始化模型
-    """
-    print("开始模型预热...")
-    dummy_image = np.zeros((640, 480, 3), dtype=np.uint8)
-    for _ in range(num_images):
-        detector.predict(dummy_image)
-    print("模型预热完成！")
-
-# 主程序入口
-if __name__ == "__main__":
-    warmup(detector)  # 模型预热
-
-    while True:
-        # 刷新裁判系统信息UI图像
-        information_ui_show = information_ui.copy()
-        map = map_backup.copy()
-        det_time = 0
-        img0 = camera_image.copy()
-        ts = time.time()
-        # 第一层神经网络识别
-        result0 = detector.predict(img0)
-        det_time += 1
-        for detection in result0:
-            cls, xywh, conf = detection
-            if cls == 'car':
-                left, top, w, h = xywh
-                left, top, w, h = int(left), int(top), int(w), int(h)
-                # 存储第一次检测结果和区域
-                # ROI出机器人区域
-                cropped = camera_image[top:top + h, left:left + w]
-                cropped_img = np.ascontiguousarray(cropped)
-                # --- 新增：收集所有ROI ---
-                if 'roi_list' not in locals():
-                    roi_list = []
-                    roi_pos = []
-                roi_list.append(cropped_img)
-                roi_pos.append((left, top, w, h))
+while True:
+    # 刷新裁判系统信息UI图像
+    information_ui_show = information_ui.copy()
+    map = map_backup.copy()
+    det_time = 0
+    img0 = camera_image.copy()
+    ts = time.time()
+    # 第一层神经网络识别
+    result0 = detector.predict(img0)
+    det_time += 1
+    for detection in result0:
+        cls, xywh, conf = detection
+        if cls == 'car':
+            left, top, w, h = xywh
+            left, top, w, h = int(left), int(top), int(w), int(h)
+            # 存储第一次检测结果和区域
+            # ROI出机器人区域
+            cropped = camera_image[top:top + h, left:left + w]
+            cropped_img = np.ascontiguousarray(cropped)
+            # --- 新增：收集所有ROI ---
+            if 'roi_list' not in locals():
+                roi_list = []
+                roi_pos = []
+            roi_list.append(cropped_img)
+            roi_pos.append((left, top, w, h))
 
 
-        # --- 新增：拼接ROI并批量识别 ---
-        def pack_rois_to_canvas(roi_list, roi_pos, canvas_size=(160, 160), padding=10):
-            """
-            将roi_list拼接到若干张canvas_size的画布上，返回画布列表和每个roi在画布中的位置
-            每个ROI四周加padding，避免目标贴边
-            """
-            canvases = []
-            canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw)]
-            cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
-            cur_rois = []
-            x, y, row_h = 0, 0, 0
-            for idx, roi in enumerate(roi_list):
-                h, w = roi.shape[:2]
-                ph, pw = h + 2 * padding, w + 2 * padding
-                if pw > canvas_size[0] or ph > canvas_size[1]:
-                    continue  # 跳过过大的roi
-                if x + pw > canvas_size[0]:
-                    x = 0
-                    y += row_h
-                    row_h = 0
-                if y + ph > canvas_size[1]:
-                    canvases.append(cur_canvas)
-                    canvas_rois.append(cur_rois)
-                    cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
-                    cur_rois = []
-                    x, y, row_h = 0, 0, 0
-                # 先填充黑色，再放ROI
-                cur_canvas[y:y + ph, x:x + pw] = 0
-                cur_canvas[y + padding:y + padding + h, x + padding:x + padding + w] = roi
-                cur_rois.append((idx, x + padding, y + padding, w, h, x, y))  # 记录带padding和原始canvas坐标
-                x += pw
-                row_h = max(row_h, ph)
-            if cur_rois:
+    # --- 新增：拼接ROI并批量识别 ---
+    def pack_rois_to_canvas(roi_list, roi_pos, canvas_size=(160, 160), padding=10):
+        """
+        将roi_list拼接到若干张canvas_size的画布上，返回画布列表和每个roi在画布中的位置
+        每个ROI四周加padding，避免目标贴边
+        """
+        canvases = []
+        canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw)]
+        cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
+        cur_rois = []
+        x, y, row_h = 0, 0, 0
+        for idx, roi in enumerate(roi_list):
+            h, w = roi.shape[:2]
+            ph, pw = h + 2 * padding, w + 2 * padding
+            if pw > canvas_size[0] or ph > canvas_size[1]:
+                continue  # 跳过过大的roi
+            if x + pw > canvas_size[0]:
+                x = 0
+                y += row_h
+                row_h = 0
+            if y + ph > canvas_size[1]:
                 canvases.append(cur_canvas)
                 canvas_rois.append(cur_rois)
-            return canvases, canvas_rois
+                cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
+                cur_rois = []
+                x, y, row_h = 0, 0, 0
+            # 先填充黑色，再放ROI
+            cur_canvas[y:y + ph, x:x + pw] = 0
+            cur_canvas[y + padding:y + padding + h, x + padding:x + padding + w] = roi
+            cur_rois.append((idx, x + padding, y + padding, w, h, x, y))  # 记录带padding和原始canvas坐标
+            x += pw
+            row_h = max(row_h, ph)
+        if cur_rois:
+            canvases.append(cur_canvas)
+            canvas_rois.append(cur_rois)
+        return canvases, canvas_rois
 
 
-        if 'roi_list' in locals() and roi_list:
-            canvases, canvas_rois = pack_rois_to_canvas(roi_list, roi_pos, padding=10)
-            # 显示所有拼接画布
-            # for i, canvas in enumerate(canvases):
-            #     cv2.imshow(f'canvas_{i}', canvas)
-            all_results = []
-            for i, (canvas, rois) in enumerate(zip(canvases, canvas_rois)):
-                result_n = detector_next.predict(canvas)
-                canvas_show = canvas.copy()
-                # 画出所有ROI内容区域
-                for idx, rx, ry, rw, rh, ox, oy in rois:
-                    cv2.rectangle(canvas_show, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)  # 红色框表示ROI内容
-                # 画出所有检测框
-                # for detection1 in result_n:
-                #     cls, xywh, conf = detection1
-                #     x, y, w, h = xywh
-                #     cv2.rectangle(canvas_show, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
-                #     cv2.putText(canvas_show, f'{cls} {conf:.2f}', (int(x), int(y) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.imshow(f'canvas_result_{i}', canvas_show)
+    if 'roi_list' in locals() and roi_list:
+        canvases, canvas_rois = pack_rois_to_canvas(roi_list, roi_pos, padding=10)
+        # 显示所有拼接画布
+        # for i, canvas in enumerate(canvases):
+        #     cv2.imshow(f'canvas_{i}', canvas)
+        all_results = []
+        for i, (canvas, rois) in enumerate(zip(canvases, canvas_rois)):
+            result_n = detector_next.predict(canvas)
+            canvas_show = canvas.copy()
+            # 画出所有ROI内容区域
+            for idx, rx, ry, rw, rh, ox, oy in rois:
+                cv2.rectangle(canvas_show, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)  # 红色框表示ROI内容
+            # 画出所有检测框
+            # for detection1 in result_n:
+            #     cls, xywh, conf = detection1
+            #     x, y, w, h = xywh
+            #     cv2.rectangle(canvas_show, (int(x), int(y)), (int(x + w), int(y + h)), (0, 255, 0), 2)
+            #     cv2.putText(canvas_show, f'{cls} {conf:.2f}', (int(x), int(y) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.imshow(f'canvas_result_{i}', canvas_show)
 
-                # 复原检测框并画到img0上（每个ROI只保留置信度最高的）
-                for idx, rx, ry, rw, rh, ox, oy in rois:
-                    best_det = None
-                    best_conf = -1
-                    best_xywh = None
-                    best_cls = None
-                    # 遍历所有检测框，找属于该ROI的
-                    for detection1 in result_n:
-                        cls, xywh, conf = detection1
-                        x, y, w, h = xywh
-                        cx, cy = x + w // 2, y + h // 2
-                        if rx <= cx < rx + rw and ry <= cy < ry + rh:
-                            if conf > best_conf:
-                                best_conf = conf
-                                best_det = detection1
-                                best_xywh = xywh
-                                best_cls = cls
-                    # 只处理置信度最高的
-                    if best_det is not None:
-                        x, y, w, h = best_xywh
-                        left, top, _, _ = roi_pos[idx]
-                        x0 = x - rx + left
-                        y0 = y - ry + top
-                        # 画框
-                        cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 0, 255), 2)
-                        cv2.putText(img0, f'{best_cls} {best_conf:.2f}', (int(x0), int(y0) - 5), cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.7, (255, 0, 255), 2)
-                        # 原图中装甲板的中心下沿作为待仿射变化的点
-                        t1 = time.time()
-                        camera_point = np.array([[[min(x0 + 0.5 * w, img_x), min(y0 + 1.5 * h, img_y)]]], dtype=np.float32)
-                        # 先套用地面层仿射变化矩阵
-                        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
+            # 复原检测框并画到img0上（每个ROI只保留置信度最高的）
+            for idx, rx, ry, rw, rh, ox, oy in rois:
+                best_det = None
+                best_conf = -1
+                best_xywh = None
+                best_cls = None
+                # 遍历所有检测框，找属于该ROI的
+                for detection1 in result_n:
+                    cls, xywh, conf = detection1
+                    x, y, w, h = xywh
+                    cx, cy = x + w // 2, y + h // 2
+                    if rx <= cx < rx + rw and ry <= cy < ry + rh:
+                        if conf > best_conf:
+                            best_conf = conf
+                            best_det = detection1
+                            best_xywh = xywh
+                            best_cls = cls
+                # 只处理置信度最高的
+                if best_det is not None:
+                    x, y, w, h = best_xywh
+                    left, top, _, _ = roi_pos[idx]
+                    x0 = x - rx + left
+                    y0 = y - ry + top
+                    # 画框
+                    cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 0, 255), 2)
+                    cv2.putText(img0, f'{best_cls} {best_conf:.2f}', (int(x0), int(y0) - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7, (255, 0, 255), 2)
+                    # 原图中装甲板的中心下沿作为待仿射变化的点
+                    t1 = time.time()
+                    camera_point = np.array([[[min(x0 + 0.5 * w, img_x), min(y0 + 1.5 * h, img_y)]]], dtype=np.float32)
+                    # 先套用地面层仿射变化矩阵
+                    mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
+                    x_c = max(int(mapped_point[0][0][0]), 0)
+                    y_c = max(int(mapped_point[0][0][1]), 0)
+                    x_c = min(x_c, width)
+                    y_c = min(y_c, height)
+                    color = mask_image[y_c, x_c]  # 通过掩码图像，获取地面层的颜色：黑（0，0，0）
+                    if color[0] == color[1] == color[2] == 0:
+                        X_M = x_c
+                        Y_M = y_c
+                        # Z_M = 0
+                    else:
+                        # 不满足则继续套用R型高地层仿射变换矩阵
+                        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_height_r)
                         x_c = max(int(mapped_point[0][0][0]), 0)
                         y_c = max(int(mapped_point[0][0][1]), 0)
                         x_c = min(x_c, width)
                         y_c = min(y_c, height)
-                        color = mask_image[y_c, x_c]  # 通过掩码图像，获取地面层的颜色：黑（0，0，0）
-                        if color[0] == color[1] == color[2] == 0:
-                            X_M = x_c
-                            Y_M = y_c
-                            # Z_M = 0
-                        else:
-                            # 不满足则继续套用R型高地层仿射变换矩阵
-                            mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_height_r)
-                            x_c = max(int(mapped_point[0][0][0]), 0)
-                            y_c = max(int(mapped_point[0][0][1]), 0)
-                            x_c = min(x_c, width)
-                            y_c = min(y_c, height)
-                            color = mask_image[y_c, x_c]  # 通过掩码图像，获取R型高地层的颜色：绿（0，255，0）
-                            X_M = x_c
-                            Y_M = y_c
-                            # Z_M = 400
-                        if isinstance(filter, SlidingWindowFilter):
-                            # 滑动窗口需要完整坐标序列
-                            filter.add_data(best_cls, X_M, Y_M)
-                        else:
-                            # 卡尔曼滤波直接更新
-                            filter.add_data(best_cls, X_M, Y_M)
-            del roi_list
-            del roi_pos
-
-        # 获取所有识别到的机器人坐标
-        all_filter_data = filter.get_all_data()
-        # print(all_filter_data_name)
-        if all_filter_data != {}:
-            for name, xyxy in all_filter_data.items():
-                # print(name, xyxy)
-                if xyxy is not None:
-                    if name[0] == "R":
-                        color_m = (0, 0, 255)
+                        color = mask_image[y_c, x_c]  # 通过掩码图像，获取R型高地层的颜色：绿（0，255，0）
+                        X_M = x_c
+                        Y_M = y_c
+                        # Z_M = 400
+                    if isinstance(filter, SlidingWindowFilter):
+                        # 滑动窗口需要完整坐标序列
+                        filter.add_data(best_cls, X_M, Y_M)
                     else:
-                        color_m = (255, 0, 0)
-                    if state == 'R':
-                        filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
-                    else:
-                        filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
-                    # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
-                    if name[0] != state:
-                        cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
-                        cv2.putText(map, str(name),
-                                    (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
-                        ser_x = int(filtered_xyz[0]) * 10 / 10
-                        ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
-                        cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
-                                    (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
-        if hasattr(filter, 'filter') and hasattr(filter.filter, 'tracks'):
-            for track in filter.filter.tracks:
-                if getattr(track, 'is_confirmed', False) and hasattr(track, 'trace'):
-                    for i in range(1, len(track.trace)):
-                        pt1 = (int(track.trace[i-1][0]), int(track.trace[i-1][1]))
-                        pt2 = (int(track.trace[i][0]), int(track.trace[i][1]))
-                        cv2.line(map, pt1, pt2, (0, 128, 255), 2)
-                    # 当前点和ID
-                    x, y = int(track.trace[-1][0]), int(track.trace[-1][1])
-                    cv2.circle(map, (x, y), 8, (0, 255, 0), -1)
-                    cv2.putText(map, f"{track.class_name} ID:{track.track_id}", (x+10, y-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
-        te = time.time()
-        t_p = te - ts
-        print("fps:", 1 / t_p)  # 打印帧率
-        # 绘制UI
-        _ = draw_information_ui(vulnerability, state, information_ui_show)
-        cv2.putText(information_ui_show, "vulnerability_chances: " + str(double_vulnerability_chance),
-                    (10, 350),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.putText(information_ui_show, "vulnerability_Triggering: " + str(opponent_double_vulnerability),
-                    (10, 400),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-        cv2.imshow('information_ui', information_ui_show)
-        map_show = cv2.resize(map, tuple(config['ui']['map_display_size']))
-        cv2.imshow('map', map_show)
-        img0 = cv2.resize(img0, tuple(config['ui']['img_display_size']))
-        cv2.imshow('img', img0)
-        if save_img:
-            img_name1 = "save_img/game1/1/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
-            img_name2 = "save_img/game1/2/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
-            cv2.imwrite(img_name1, map_show)
-            cv2.imwrite(img_name2, img0)
-        visualize_results(img0, map, all_filter_data)  # 可视化检测和追踪结果
+                        # 卡尔曼滤波直接更新
+                        filter.add_data(best_cls, X_M, Y_M)
+        del roi_list
+        del roi_pos
 
-        key = cv2.waitKey(1)
-        if key == ord('q'):  # 按 'q' 退出
-            print("退出程序")
-            break
-        elif key == ord('s'):  # 按 's' 暂停
-            print("程序暂停，按 'r' 恢复")
-            while True:
-                key2 = cv2.waitKey(1)
-                if key2 == ord('r'):  # 按 'r' 恢复
-                    print("恢复程序")
-                    break
+    # 获取所有识别到的机器人坐标
+    all_filter_data = filter.get_all_data()
+    # print(all_filter_data_name)
+    if all_filter_data != {}:
+        for name, xyxy in all_filter_data.items():
+            # print(name, xyxy)
+            if xyxy is not None:
+                if name[0] == "R":
+                    color_m = (0, 0, 255)
+                else:
+                    color_m = (255, 0, 0)
+                if state == 'R':
+                    filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
+                else:
+                    filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
+                # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
+                if name[0] != state:
+                    cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
+                    cv2.putText(map, str(name),
+                                (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
+                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+                    ser_x = int(filtered_xyz[0]) * 10 / 10
+                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
+                    cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
+                                (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
+
+    te = time.time()
+    t_p = te - ts
+    print("fps:", 1 / t_p)  # 打印帧率
+    # 绘制UI
+    _ = draw_information_ui(vulnerability, state, information_ui_show)
+    cv2.putText(information_ui_show, "vulnerability_chances: " + str(double_vulnerability_chance),
+                (10, 350),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.putText(information_ui_show, "vulnerability_Triggering: " + str(opponent_double_vulnerability),
+                (10, 400),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    cv2.imshow('information_ui', information_ui_show)
+    map_show = cv2.resize(map, tuple(config['ui']['map_display_size']))
+    cv2.imshow('map', map_show)
+    img0 = cv2.resize(img0, tuple(config['ui']['img_display_size']))
+    cv2.imshow('img', img0)
+    if save_img:
+        img_name1 = "save_img/game1/1/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+        img_name2 = "save_img/game1/2/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+        cv2.imwrite(img_name1, map_show)
+        cv2.imwrite(img_name2, img0)
+    key = cv2.waitKey(1)

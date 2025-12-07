@@ -31,20 +31,21 @@ class YOLOv5Detector:
     def __init__(self, weights_path, img_size=(640, 640), conf_thres=0.70, iou_thres=0.2, max_det=10,
                  device='', classes=None, agnostic_nms=False, augment=False, visualize=False, half=True, dnn=False,
                  data='data/coco128.yaml', ui=False):
-        # 设置设备
+        # 设置设备 - 强制使用CPU
         self.ui = ui
-        self.device = select_device(device)
+        self.device = select_device('cpu')  # 强制使用CPU
+        print(f"使用设备: {self.device}")
 
-        # 加载模型
-        self.model = DetectMultiBackend(weights_path, device=self.device, dnn=dnn, fp16=half, data=data)
+        # 加载模型 - 禁用半精度(CPU不支持FP16)
+        self.model = DetectMultiBackend(weights_path, device=self.device, dnn=dnn, fp16=False, data=data)
 
         stride, self.names, pt, jit, onnx, engine = self.model.stride, self.model.names, self.model.pt, self.model.jit, self.model.onnx, self.model.engine
         self.img_size = check_img_size(img_size, s=stride)
         self.colors = [[random.randint(0, 255) for _ in range(3)] for _ in self.names]
-        # 使用半精度 Float16 推理
-        self.half = half and (pt or jit or onnx or engine) and self.device.type != 'cpu'
+        # CPU模式下禁用半精度
+        self.half = False  # CPU不支持半精度
         if pt or jit:
-            self.model.model.half() if self.half else self.model.model.float()
+            self.model.model.float()  # 使用全精度Float32
         self.save_time = 0
         self.conf_thres = conf_thres
         self.iou_thres = iou_thres
