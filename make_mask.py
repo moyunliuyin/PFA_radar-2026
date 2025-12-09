@@ -54,7 +54,7 @@ def create_irregular_mask(image_path):
         return
 
     # 设置缩放比例，目标宽度为 450 像素
-    target_width = 450
+    target_width = 430
     h, w = original_image.shape[:2]
     scale_factor = target_width / w
     scaled_image = cv2.resize(original_image, (target_width, int(h * scale_factor)))

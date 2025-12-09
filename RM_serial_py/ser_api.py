@@ -103,7 +103,7 @@ def build_data_radar(target_robot_id, target_position_x, target_position_y):
 
 
 # 雷达数据部分构建示例
-def build_data_radar_all(send_map,state):
+def build_data_radar_enemy(send_map,state):
     if state == 'R':
         data = bytearray()
         data.extend(bytearray(struct.pack('H', int(send_map['B1'][0]))))  # x坐标 (小端)
@@ -142,6 +142,50 @@ def build_data_radar_all(send_map,state):
 
         data.extend(bytearray(struct.pack('H', int(send_map['R7'][0]))))  # x坐标 (小端)
         data.extend(bytearray(struct.pack('H', int(send_map['R7'][1]))))  # y坐标 (小端)
+
+    return data
+
+
+# 己方雷达数据部分构建（命令ID: 0x020B）
+def build_data_radar_self(send_map_self, state):
+    if state == 'R':  # 红方发送红方机器人坐标
+        data = bytearray()
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R1'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R1'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R2'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R2'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R3'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R3'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R4'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R4'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R5'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R5'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R7'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['R7'][1]))))  # y坐标 (小端)
+    else:  # 蓝方发送蓝方机器人坐标
+        data = bytearray()
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B1'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B1'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B2'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B2'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B3'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B3'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B4'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B4'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B5'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B5'][1]))))  # y坐标 (小端)
+
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B7'][0]))))  # x坐标 (小端)
+        data.extend(bytearray(struct.pack('H', int(send_map_self['B7'][1]))))  # y坐标 (小端)
 
     return data
 
