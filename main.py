@@ -16,7 +16,7 @@ import cv2
 import numpy as np
 from detect_function import YOLOv5Detector
 from RM_serial_py.ser_api import build_send_packet, receive_packet, Radar_decision, \
-    build_data_decision, build_data_radar_all
+    build_data_decision, build_data_radar_enemy, build_data_radar_self
 import yaml
 
 with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
@@ -558,7 +558,7 @@ def ser_send():
         # front_time = time.time()
         # 转换为地图坐标系
         filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
-        # 转换为裁判系统单位M
+        # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
         ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
@@ -572,7 +572,7 @@ def ser_send():
         # time.sleep(0.1 - waste_time)
         return ser_x, ser_y
 
-    # 发送红发机器人坐标
+    # 发送红方机器人坐标
     def send_point_R(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
@@ -589,6 +589,24 @@ def ser_send():
         # waste_time = back_time - front_time
         # # print('发送：',send_name, seq_s)
         # time.sleep(0.1 - waste_time)
+        return ser_x, ser_y
+
+    # 发送蓝方己方机器人坐标（单位：米M）
+    def send_point_self_B(send_name, all_filter_data):
+        # 转换为地图坐标系
+        filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        # 转换为裁判系统单位M（米）- 从厘米除以100转换为米
+        ser_x = int(filtered_xyz[0]) / 100.0
+        ser_y = (1500 - int(filtered_xyz[1])) / 100.0
+        return ser_x, ser_y
+
+    # 发送红方己方机器人坐标（单位：米M）
+    def send_point_self_R(send_name, all_filter_data):
+        # 转换为地图坐标系
+        filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
+        # 转换为裁判系统单位M（米）- 从厘米除以100转换为米
+        ser_x = int(filtered_xyz[0]) / 100.0
+        ser_y = (1500 - int(filtered_xyz[1])) / 100.0
         return ser_x, ser_y
 
     # 发送盲区预测点坐标
@@ -634,6 +652,19 @@ def ser_send():
         "B5": (0, 0),
         "B6": (0, 0),
         "B7": (0, 0)
+    }
+
+    # 己方位置字典（用于发送己方机器人位置到裁判系统，命令ID: 0x020B）
+    # 新结构体只包含4个地面机器人：hero, engineer, standard_3, standard_4
+    send_map_self = {
+        "R1": (0, 0),  # 红方英雄
+        "R6": (0, 0),  # 红方工程
+        "R3": (0, 0),  # 红方步兵3号
+        "R4": (0, 0),  # 红方步兵4号
+        "B1": (0, 0),  # 蓝方英雄
+        "B6": (0, 0),  # 蓝方工程
+        "B3": (0, 0),  # 蓝方步兵3号
+        "B4": (0, 0)   # 蓝方步兵4号
     }
     while True:
 
@@ -684,6 +715,14 @@ def ser_send():
                     if all_filter_data.get('B7', False):
                         send_map['B7'] = send_point_B('B7', all_filter_data)
 
+                # 填充己方（红方）机器人位置（单位：米M）
+                # 只包含4个地面机器人：hero(R1), engineer(R6), standard_3(R3), standard_4(R4)
+                for robot_id in ['R1', 'R6', 'R3', 'R4']:
+                    if all_filter_data.get(robot_id, False):
+                        send_map_self[robot_id] = send_point_self_R(robot_id, all_filter_data)
+                    else:
+                        send_map_self[robot_id] = (0, 0)
+
             if state == 'B':
                 if not guess_list.get('R1'):
                     if all_filter_data.get('R1', False):
@@ -725,11 +764,26 @@ def ser_send():
                     if all_filter_data.get('R7', False):
                         send_map['R7'] = send_point_R('R7', all_filter_data)
 
-            ser_data = build_data_radar_all(send_map, state)
+                # 填充己方（蓝方）机器人位置（单位：米M）
+                # 只包含4个地面机器人：hero(B1), engineer(B6), standard_3(B3), standard_4(B4)
+                for robot_id in ['B1', 'B6', 'B3', 'B4']:
+                    if all_filter_data.get(robot_id, False):
+                        send_map_self[robot_id] = send_point_self_B(robot_id, all_filter_data)
+                    else:
+                        send_map_self[robot_id] = (0, 0)
+
+            ser_data = build_data_radar_enemy(send_map, state)
             packet, seq = build_send_packet(ser_data, seq, [0x03, 0x05])
             ser1.write(packet)
             time.sleep(0.2)
             print(send_map, seq)
+
+            # 发送己方位置到裁判系统（命令ID: 0x020B）
+            ser_data_self = build_data_radar_self(send_map_self, state)
+            packet_self, seq = build_send_packet(ser_data_self, seq, [0x02, 0x0B])
+            ser1.write(packet_self)
+            print("己方:", send_map_self, "seq:", seq)
+
             # 超过单点预测时间上限，更新上次预测的进度
             if time.time() - update_time > guess_time_limit:
                 update_time = time.time()
@@ -1069,17 +1123,17 @@ while True:
                     filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
                 else:
                     filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
-                # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
-                if name[0] != state:
-                    cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
-                    cv2.putText(map, str(name),
-                                (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
-                    ser_x = int(filtered_xyz[0]) * 10 / 10
-                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
-                    cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
-                                (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
+                # 绘制双方阵营的机器人（使用各自阵营颜色：红方=红色，蓝方=蓝色）
+                # if name[0] != state:  # 原本只绘制敌方，现已注释
+                cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
+                cv2.putText(map, str(name),
+                            (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+                ser_x = int(filtered_xyz[0]) * 10 / 10
+                ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
+                cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
+                            (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
 
     te = time.time()
     t_p = te - ts
