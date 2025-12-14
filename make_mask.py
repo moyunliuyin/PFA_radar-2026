@@ -53,7 +53,7 @@ def create_irregular_mask(image_path):
         print("Failed to load image.")
         return
 
-    # 设置缩放比例，目标宽度为 450 像素
+    # 设置缩放比例，目标宽度为 500 像素
     target_width = 430
     h, w = original_image.shape[:2]
     scale_factor = target_width / w
