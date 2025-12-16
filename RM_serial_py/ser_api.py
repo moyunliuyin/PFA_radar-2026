@@ -149,7 +149,7 @@ def build_data_radar_enemy(send_map,state):
 # 己方雷达数据部分构建（命令ID: 0x020B）
 # 结构体: ground_robot_position_t
 # 包含5个机器人的位置 (float类型) + 2个保留位
-# 顺序: hero(R1/B1) → engineer(R6/B6) → standard_3(R3/B3) → standard_4(R4/B4) → 保留位(2个float)
+# 顺序: hero(R1/B1) → engineer(R2/B2) → standard_3(R3/B3) → standard_4(R4/B4) → 保留位(2个float)
 # 总共: 10个float = 40字节
 def build_data_radar_self(send_map_self, state):
     if state == 'R':  # 红方发送红方机器人坐标
@@ -158,9 +158,9 @@ def build_data_radar_self(send_map_self, state):
         data.extend(bytearray(struct.pack('f', float(send_map_self['R1'][0]))))  # hero_x (小端)
         data.extend(bytearray(struct.pack('f', float(send_map_self['R1'][1]))))  # hero_y (小端)
 
-        # engineer_x, engineer_y (R6)
-        data.extend(bytearray(struct.pack('f', float(send_map_self['R6'][0]))))  # engineer_x (小端)
-        data.extend(bytearray(struct.pack('f', float(send_map_self['R6'][1]))))  # engineer_y (小端)
+        # engineer_x, engineer_y (R2)
+        data.extend(bytearray(struct.pack('f', float(send_map_self['R2'][0]))))  # engineer_x (小端)
+        data.extend(bytearray(struct.pack('f', float(send_map_self['R2'][1]))))  # engineer_y (小端)
 
         # standard_3_x, standard_3_y (R3)
         data.extend(bytearray(struct.pack('f', float(send_map_self['R3'][0]))))  # standard_3_x (小端)
@@ -180,9 +180,9 @@ def build_data_radar_self(send_map_self, state):
         data.extend(bytearray(struct.pack('f', float(send_map_self['B1'][0]))))  # hero_x (小端)
         data.extend(bytearray(struct.pack('f', float(send_map_self['B1'][1]))))  # hero_y (小端)
 
-        # engineer_x, engineer_y (B6)
-        data.extend(bytearray(struct.pack('f', float(send_map_self['B6'][0]))))  # engineer_x (小端)
-        data.extend(bytearray(struct.pack('f', float(send_map_self['B6'][1]))))  # engineer_y (小端)
+        # engineer_x, engineer_y (B2)
+        data.extend(bytearray(struct.pack('f', float(send_map_self['B2'][0]))))  # engineer_x (小端)
+        data.extend(bytearray(struct.pack('f', float(send_map_self['B2'][1]))))  # engineer_y (小端)
 
         # standard_3_x, standard_3_y (B3)
         data.extend(bytearray(struct.pack('f', float(send_map_self['B3'][0]))))  # standard_3_x (小端)
