@@ -660,11 +660,11 @@ def ser_send():
     # 新结构体只包含4个地面机器人：hero, engineer, standard_3, standard_4
     send_map_self = {
         "R1": (0, 0),  # 红方英雄
-        "R6": (0, 0),  # 红方工程
+        "R2": (0, 0),  # 红方工程
         "R3": (0, 0),  # 红方步兵3号
         "R4": (0, 0),  # 红方步兵4号
         "B1": (0, 0),  # 蓝方英雄
-        "B6": (0, 0),  # 蓝方工程
+        "B2": (0, 0),  # 蓝方工程
         "B3": (0, 0),  # 蓝方步兵3号
         "B4": (0, 0)   # 蓝方步兵4号
     }
@@ -718,8 +718,8 @@ def ser_send():
                         send_map['B7'] = send_point_B('B7', all_filter_data)
 
                 # 填充己方（红方）机器人位置（单位：米M）
-                # 只包含4个地面机器人：hero(R1), engineer(R6), standard_3(R3), standard_4(R4)
-                for robot_id in ['R1', 'R6', 'R3', 'R4']:
+                # 只包含4个地面机器人：hero(R1), engineer(R2), standard_3(R3), standard_4(R4)
+                for robot_id in ['R1', 'R2', 'R3', 'R4']:
                     if all_filter_data.get(robot_id, False):
                         send_map_self[robot_id] = send_point_self_R(robot_id, all_filter_data)
                     else:
@@ -767,8 +767,8 @@ def ser_send():
                         send_map['R7'] = send_point_R('R7', all_filter_data)
 
                 # 填充己方（蓝方）机器人位置（单位：米M）
-                # 只包含4个地面机器人：hero(B1), engineer(B6), standard_3(B3), standard_4(B4)
-                for robot_id in ['B1', 'B6', 'B3', 'B4']:
+                # 只包含4个地面机器人：hero(B1), engineer(B2), standard_3(B3), standard_4(B4)
+                for robot_id in ['B1', 'B2', 'B3', 'B4']:
                     if all_filter_data.get(robot_id, False):
                         send_map_self[robot_id] = send_point_self_B(robot_id, all_filter_data)
                     else:
