@@ -198,7 +198,7 @@ class MyUI(QWidget):
             right_image_path = "images-2026/red.jpg"  # 替换为右边图片的路径
         else:
             self.save_path = 'arrays_test_blue.npy'
-            right_image_path = "images-2026/blue.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2026/map_blue.jpg"  # 替换为右边图片的路径
 
         # _,left_image = self.camera_capture.read()
         left_image = camera_image
