@@ -73,6 +73,7 @@ information_ui_show = information_ui.copy()
 double_vulnerability_chance = -1  # 双倍易伤机会数
 opponent_double_vulnerability = -1  # 是否正在触发双倍易伤
 target = -1  # 飞镖当前瞄准目标（用于触发双倍易伤）
+key_modifiable = -1  # 密钥是否可修改
 chances_flag = 1  # 双倍易伤触发标志位，需要从1递增，每小局比赛会重置，所以每局比赛要重启程序
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
 
@@ -775,6 +776,7 @@ def ser_receive():
     global vulnerability  # 标记进度列表
     global double_vulnerability_chance  # 拥有双倍易伤次数
     global opponent_double_vulnerability  # 双倍易伤触发状态
+    global key_modifiable  # 密钥是否可修改
     global target  # 飞镖当前目标
     progress_cmd_id = [0x02, 0x0C]  # 任意想要接收数据的命令码，这里是雷达标记进度的命令码0x020C
     vulnerability_cmd_id = [0x02, 0x0E]  # 双倍易伤次数和触发状态
@@ -827,7 +829,7 @@ def ser_receive():
                 if vulnerability_result is not None:
                     received_cmd_id2, received_data2, received_seq2 = vulnerability_result
                     received_data2 = list(received_data2)[0]
-                    double_vulnerability_chance, opponent_double_vulnerability = Radar_decision(received_data2)
+                    double_vulnerability_chance, opponent_double_vulnerability, key_modifiable = Radar_decision(received_data2)
                 if target_result is not None:
                     received_cmd_id3, received_data3, received_seq3 = target_result
                     target = (list(received_data3)[1] & 0b1100000) >> 5

@@ -257,12 +257,14 @@ def Radar_decision(byte_data):
     # 提取第 2 位的对方双倍易伤状态
     opponent_double_vulnerability = (byte_data & 0b00000100) >> 2
 
-    # 提取第 3-7 位（保留位，不使用）
-    reserved_bits = (byte_data & 0b11111000) >> 3
+    # 提取第 5 位的密钥修改标志
+    key_modifiable = (byte_data & 0b00100000) >> 5
+
+    # 提取第 3-4, 6-7 位（保留位，不使用）
+    # reserved_bits = (byte_data & 0b11011000) >> 3
 
     # 打印结果
-
     # print(f"双倍易伤机会: {double_vulnerability_chance}")
     # print(f"对方正在被触发双倍易伤: {opponent_double_vulnerability}")
-    # print(f"保留位: {reserved_bits}")
-    return double_vulnerability_chance, opponent_double_vulnerability
+    # print(f"密钥是否可修改: {key_modifiable}")
+    return double_vulnerability_chance, opponent_double_vulnerability, key_modifiable
