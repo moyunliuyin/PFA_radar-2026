@@ -6,6 +6,7 @@
 import datetime
 import threading
 import time
+import struct
 from collections import deque
 import serial
 from information_ui import draw_information_ui
@@ -558,7 +559,7 @@ def ser_send():
         # front_time = time.time()
         # 转换为地图坐标系
         filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
-        # 转换为裁判系统单位M
+        # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
         ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
@@ -572,12 +573,12 @@ def ser_send():
         # time.sleep(0.1 - waste_time)
         return ser_x, ser_y
 
-    # 发送红发机器人坐标
+    # 发送红方机器人坐标
     def send_point_R(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
         filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
-        # 转换为裁判系统单位M
+        # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
         ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
@@ -775,7 +776,7 @@ def ser_receive():
     global double_vulnerability_chance  # 拥有双倍易伤次数
     global opponent_double_vulnerability  # 双倍易伤触发状态
     global target  # 飞镖当前目标
-    progress_cmd_id = [0x02, 0x0C]  # 任意想要接收数据的命令码，这里是雷达标记进度的命令码0x020E
+    progress_cmd_id = [0x02, 0x0C]  # 任意想要接收数据的命令码，这里是雷达标记进度的命令码0x020C
     vulnerability_cmd_id = [0x02, 0x0E]  # 双倍易伤次数和触发状态
     target_cmd_id = [0x01, 0x05]  # 飞镖目标
     buffer = b''  # 初始化缓冲区
@@ -813,8 +814,8 @@ def ser_receive():
                 # 更新裁判系统数据，标记进度、易伤、飞镖目标
                 if progress_result is not None:
                     received_cmd_id1, received_data1, received_seq1 = progress_result
-                    # vulnerability = received_data1[0]
-                    vulnerability = [((received_data1[0] >> i) & 0x01) * 120 for i in range(5)]
+                    mark_progress = struct.unpack('H', received_data1[:2])[0]
+                    vulnerability = [((mark_progress >> i) & 0x01) * 120 for i in range(5)]
                     if state == 'R':
                         guess_value_now['B1'] = vulnerability[0]
                         guess_value_now['B2'] = vulnerability[1]
