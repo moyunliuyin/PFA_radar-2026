@@ -1,0 +1,122 @@
+
+# 模型路径
+models:
+  vehicle: 'models/car.pt'      # 车辆检测模型
+  armor: 'models/armor.pt'      # 装甲板检测模型
+
+# 串口配置
+serial:
+  port: 'COM8'                  # 串口号
+  baudrate: 115200              # 波特率
+  enable_velocity_feedforward: true  # 是否启用速度前馈（发送角速度到下位机）
+
+  # - 四个float32打包，共16字节
+  # - 使用 struct.pack('<ffff', pitch, roll, v_pitch, v_roll)
+  # - 字节0-3: pitch角度（度，float32）
+  # - 字节4-7: roll角度（度，float32）
+  # - 字节8-11: pitch角速度（度/秒，float32）
+  # - 字节12-15: roll角速度（度/秒，float32）
+  # 【当 enable_velocity_feedforward = false 时】
+  # - 两个float32打包，共8字节
+  # - 使用 struct.pack('<ff', pitch, roll)
+  # - 字节0-3: pitch角度（float32）
+  # - 字节4-7: roll角度（float32）
+
+# GPU配置
+gpu:
+  enable: false                 # 是否使用GPU加速
+
+# 相机采集参数
+camera:
+  exposure_time: 55915.0        # 曝光时间（微秒）35000 = 35ms
+  gain: 10                      # 增益（dB），范围 0-24
+  
+# 相机标定参数
+calibration:
+  fx: 15989.09                  # 水平焦距（像素）
+  fy: 15985.61                  # 垂直焦距（像素）
+  cx: null                      # 主点x（null=图像中心）
+  cy: null                      # 主点y（null=图像中心）
+  dist_coeffs: null             # 畸变系数 [k1,k2,p1,p2,k3]（null=无畸变）
+  enable_undistort: true        # 是否启用畸变校正
+  
+  # 从文件加载标定参数
+  use_file: false               # 是否从文件加载
+  file_path: 'camera_params.npz'
+
+# 检测器参数
+detector:
+  # 检测策略：先直接检测装甲板，失败后再检测车辆ROI
+  strategy: 'armor_first'       # 'armor_first' 或 'vehicle_first'
+  vehicle:
+    img_size: [640, 640]        # 输入图像尺寸
+    conf_thres: 0.10            # 置信度阈值
+    iou_thres: 0.50             # NMS IOU阈值
+    max_det: 14                 # 最大检测数
+  armor:
+    img_size: [384, 384]        # 输入图像尺寸（平衡精度与速度）
+    conf_thres: 0.10            # 置信度阈值
+    iou_thres: 0.40             # NMS IOU阈值
+    max_det: 1                  # 最大检测数（优先最高置信度）
+
+# ROI策略
+roi:
+  expand_ratio: 0.15            # ROI扩展比例（向外扩展15%）
+  min_size: 20                  # 最小ROI尺寸
+  search_size: 200              # 目标丢失后的搜索区域大小
+
+# 滤波器配置
+filter:
+  type: 'predictive_kalman'    # 滤波器类型：'ema_1d'（一维EMA）或 'predictive_kalman'（卡尔曼预测）
+
+  # 卡尔曼预测滤波器配置（推荐使用，有延迟补偿）
+  predictive_kalman:
+    enabled: true               # 是否启用卡尔曼预测滤波器
+    prediction_time_ms: 150.0   # 预测补偿时间（毫秒）
+    process_noise: 1e-2         # 过程噪声，越大越信任测量值
+    measurement_noise: 1e-1     # 测量噪声，越大越信任预测值
+    max_rate_pitch: 60.0        # pitch最大速率限制（度/秒）
+    max_rate_roll: 60.0         # roll最大速率限制（度/秒）
+    # 调整：运行时按 k/l 键调整预测时间（±20ms）
+
+  # EMA滤波器配置（备用）
+  ema:
+    alpha_pitch: 0.15           # pitch轴平滑系数（降低响应速度，减少过冲）
+    alpha_roll: 0.15            # roll轴平滑系数（降低响应速度，减少过冲）
+    max_inactive_time: 2.0      # 最大不活跃时间（秒），超时重置
+    max_rate_pitch: 30.0        # pitch轴最大变化速率（度/秒）- 降低以避免快速累积
+    max_rate_roll: 30.0         # roll轴最大变化速率（度/秒）- 降低以避免快速累积
+
+# 死区控制配置
+deadzone:
+  enabled: true                 # 是否启用死区控制
+  pitch: 0.8                    # pitch轴死区阈值（度）- 增大以减少频繁调整
+  roll: 0.6                     # roll轴死区阈值（度）- 增大以减少频繁调整
+
+# 帧间隔控制配置
+frame_interval:
+  enabled: true                 # 是否启用帧间隔控制
+  interval: 3                   # 检测间隔（每N帧检测一次）
+
+# 云台控制
+gimbal:
+  mode: 'absolute'              # 控制模式：'absolute'（绝对角度）
+  # 角度累积说明：
+  # - 程序启动时为初始姿态（0,0）
+  # - 每帧计算偏移角度并累积
+
+# 目标跟踪
+tracking:
+  max_lost_frames: 10           # 最大丢失帧数
+  max_distance: 200             # 目标关联最大距离（像素）
+  
+# 可视化
+visualization:
+  show_vehicle_box: true        # 显示车辆框
+  show_armor_box: true          # 显示装甲板框
+  show_trajectory: false         # 显示轨迹
+  trajectory_length: 50         # 轨迹最大长度
+  show_target_id: false          # 显示目标ID
+  show_stats: true              # 显示统计信息
+  show_detect_method: false      # 显示检测方式（direct/vehicle_roi/search_roi）
+
