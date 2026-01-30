@@ -23,111 +23,6 @@ except ImportError:
     sys.exit(1)
 
 
-class EMAFilter1D:
-    #一维指数移动平均滤波器 - 用于平滑角度输出，防止云台抖动
-    def __init__(self, alpha=0.3, max_inactive_time=2.0, max_rate=None):
-        """
-        Args:
-            alpha: 平滑系数 (0-1)，越小越平滑但响应越慢
-                   推荐值：0.2-0.4 用于云台控制
-            max_inactive_time: 最大不活跃时间（秒），超时后重置
-            max_rate: 最大变化速率（单位/秒），用于限制突变，None表示不限制
-        """
-        self.alpha = alpha
-        self.max_inactive_time = max_inactive_time
-        self.max_rate = max_rate
-        self.value = None
-        self.last_update_time = None
-        self.last_raw_value = None
-        
-    def update(self, raw_value):
-        """更新滤波器并返回平滑后的值"""
-        current_time = time.time()
-        
-        # 检查是否超时需要重置
-        if self.last_update_time and (current_time - self.last_update_time) > self.max_inactive_time:
-            self.reset()
-        
-        # 首次更新，直接使用原始值
-        if self.value is None:
-            self.value = raw_value
-            self.last_update_time = current_time
-            self.last_raw_value = raw_value
-            return self.value
-        
-        # 速率限制（防止突变）
-        if self.max_rate is not None and self.last_update_time:
-            dt = current_time - self.last_update_time
-            if dt > 0:
-                max_change = self.max_rate * dt
-                delta = raw_value - self.last_raw_value
-                if abs(delta) > max_change:
-                    raw_value = self.last_raw_value + max_change * (1 if delta > 0 else -1)
-        
-        # EMA计算: new_value = alpha * raw + (1 - alpha) * old
-        self.value = self.alpha * raw_value + (1 - self.alpha) * self.value
-        self.last_update_time = current_time
-        self.last_raw_value = raw_value
-        
-        return self.value
-    
-    def get_value(self):
-        """获取当前滤波后的值"""
-        return self.value
-    
-    def is_active(self):
-        """检查滤波器是否活跃"""
-        if not self.last_update_time:
-            return False
-        return (time.time() - self.last_update_time) <= self.max_inactive_time
-    
-    def reset(self):
-        """重置滤波器"""
-        self.value = None
-        self.last_update_time = None
-        self.last_raw_value = None
-
-
-class DualAxisFilter:
-    """双轴一维滤波器 - 分别对pitch和roll进行独立滤波
-    """
-    def __init__(self, alpha_pitch=0.3, alpha_roll=0.3, 
-                 max_inactive_time=2.0, max_rate_pitch=None, max_rate_roll=None):
-        """
-        Args:
-            alpha_pitch: pitch轴平滑系数
-            alpha_roll: roll轴平滑系数
-            max_inactive_time: 最大不活跃时间
-            max_rate_pitch: pitch轴最大变化速率（度/秒）
-            max_rate_roll: roll轴最大变化速率（度/秒）
-        """
-        self.pitch_filter = EMAFilter1D(alpha=alpha_pitch, 
-                                        max_inactive_time=max_inactive_time,
-                                        max_rate=max_rate_pitch)
-        self.roll_filter = EMAFilter1D(alpha=alpha_roll, 
-                                       max_inactive_time=max_inactive_time,
-                                       max_rate=max_rate_roll)
-    
-    def update(self, pitch, roll):
-        """更新两轴角度并返回平滑后的值"""
-        filtered_pitch = self.pitch_filter.update(pitch)
-        filtered_roll = self.roll_filter.update(roll)
-        return filtered_pitch, filtered_roll
-    
-    def get_values(self):
-        """获取当前滤波后的角度值"""
-        return self.pitch_filter.get_value(), self.roll_filter.get_value()
-    
-    def is_active(self):
-        """检查滤波器是否活跃"""
-        return self.pitch_filter.is_active() and self.roll_filter.is_active()
-    
-    def reset(self):
-        """重置滤波器"""
-        self.pitch_filter.reset()
-        self.roll_filter.reset()
-
-
 class PredictiveKalmanFilter:
     """带预测功能的双轴卡尔曼滤波器 - 用于云台角度控制
     状态向量: [pitch, roll, v_pitch, v_roll]
@@ -528,12 +423,9 @@ class AerialTrackingSystem:
                  camera_cx=None, camera_cy=None,
                  dist_coeffs=None, enable_undistort=True,
                  camera_exposure=55915.0, camera_gain=10.5,
-                 use_predictive_kalman=True,
                  kalman_prediction_time_ms=200.0,
                  kalman_process_noise=1e-3,
                  kalman_measurement_noise=1e-1,
-                 ema_alpha_pitch=0.3,
-                 ema_alpha_roll=0.3,
                  max_rate_pitch=60.0,
                  max_rate_roll=60.0,
                  enable_velocity_feedforward=True):
@@ -635,43 +527,24 @@ class AerialTrackingSystem:
         print(f"初始化串口通信...")
         self.serial = create_serial(port=serial_port, baudrate=baudrate, raw_payload=True)
 
-        # 滤波器选择：卡尔曼预测滤波器 或 EMA滤波器
-        self.use_predictive_kalman = use_predictive_kalman
-
-        if use_predictive_kalman:
-            # 使用卡尔曼预测滤波器（带延迟补偿）
-            self.angle_filter = PredictiveKalmanFilter(
-                prediction_time_ms=kalman_prediction_time_ms,
-                process_noise=kalman_process_noise,
-                measurement_noise=kalman_measurement_noise,
-                max_inactive_time=2.0,
-                max_rate_pitch=max_rate_pitch,
-                max_rate_roll=max_rate_roll
-            )
-            print(f"✓ 使用卡尔曼预测滤波器")
-            print(f"  预测时间: {kalman_prediction_time_ms}ms")
-            print(f"  过程噪声: {kalman_process_noise}, 测量噪声: {kalman_measurement_noise}")
-            print(f"  速率限制: pitch={max_rate_pitch}°/s, roll={max_rate_roll}°/s")
-        else:
-            # 使用一维双轴EMA滤波器（独立滤波pitch和roll角度）
-            self.angle_filter = DualAxisFilter(
-                alpha_pitch=ema_alpha_pitch,
-                alpha_roll=ema_alpha_roll,
-                max_inactive_time=2.0,
-                max_rate_pitch=max_rate_pitch,
-                max_rate_roll=max_rate_roll
-            )
-            print(f"✓ 使用一维双轴EMA滤波器")
-            print(f"  平滑系数: pitch={ema_alpha_pitch}, roll={ema_alpha_roll}")
-            print(f"  速率限制: pitch={max_rate_pitch}°/s, roll={max_rate_roll}°/s")
+        # 使用卡尔曼预测滤波器（带延迟补偿）
+        self.angle_filter = PredictiveKalmanFilter(
+            prediction_time_ms=kalman_prediction_time_ms,
+            process_noise=kalman_process_noise,
+            measurement_noise=kalman_measurement_noise,
+            max_inactive_time=2.0,
+            max_rate_pitch=max_rate_pitch,
+            max_rate_roll=max_rate_roll
+        )
+        print(f"✓ 使用卡尔曼预测滤波器")
+        print(f"  预测时间: {kalman_prediction_time_ms}ms")
+        print(f"  过程噪声: {kalman_process_noise}, 测量噪声: {kalman_measurement_noise}")
+        print(f"  速率限制: pitch={max_rate_pitch}°/s, roll={max_rate_roll}°/s")
 
         # 速度前馈配置
         self.enable_velocity_feedforward = enable_velocity_feedforward
         if enable_velocity_feedforward:
             print(f"✓ 速度前馈已启用（发送位置+速度到下位机，16字节）")
-            if not use_predictive_kalman:
-                print(f"⚠️  警告: EMA滤波器不估计速度，速度前馈将始终为0")
-                print(f"   建议: 启用卡尔曼预测滤波器以获得速度估计")
         else:
             print(f"✓ 速度前馈已禁用（仅发送位置，8字节）")
 
@@ -949,7 +822,7 @@ class AerialTrackingSystem:
         # 获取角速度（度/秒）
         v_pitch = 0.0
         v_roll = 0.0
-        if self.enable_velocity_feedforward and self.use_predictive_kalman:
+        if self.enable_velocity_feedforward:
             # 估计速度
             v_pitch, v_roll = self.angle_filter.get_velocity()
             
@@ -1244,9 +1117,8 @@ class AerialTrackingSystem:
                 cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 210), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
-                # 动态显示滤波器类型
-                filter_type = "Kalman-Pred" if self.use_predictive_kalman else "EMA (1D)"
-                cv2.putText(frame, f"Filter: {filter_type}", (10, 240), 
+                # 显示滤波器类型
+                cv2.putText(frame, f"Filter: Kalman-Pred", (10, 240), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 
                 # 显示云台绝对姿态
@@ -1264,52 +1136,30 @@ class AerialTrackingSystem:
                     break
                 elif key == ord('a'):
                     # 调整滤波器参数（增加平滑度）
-                    if self.use_predictive_kalman:
-                        # 卡尔曼滤波器：降低过程噪声（更信任预测）
-                        current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                        new_pn = max(1e-5, current_pn * 0.8)
-                        self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
-                        print(f"✓ 卡尔曼过程噪声降低为 {new_pn:.2e} (更平滑)")
-                    else:
-                        # EMA滤波器：降低alpha
-                        current_alpha = self.angle_filter.pitch_filter.alpha
-                        new_alpha = max(0.1, current_alpha - 0.05)
-                        self.angle_filter.pitch_filter.alpha = new_alpha
-                        self.angle_filter.roll_filter.alpha = new_alpha
-                        print(f"✓ 滤波器alpha降低为 {new_alpha:.2f} (更平滑)")
+                    # 卡尔曼滤波器：降低过程噪声（更信任预测）
+                    current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
+                    new_pn = max(1e-5, current_pn * 0.8)
+                    self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
+                    print(f"✓ 卡尔曼过程噪声降低为 {new_pn:.2e} (更平滑)")
                 elif key == ord('s'):
                     # 调整滤波器参数（增加响应速度）
-                    if self.use_predictive_kalman:
-                        # 卡尔曼滤波器：提高过程噪声（更信任测量）
-                        current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                        new_pn = min(1.0, current_pn * 1.2)
-                        self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
-                        print(f"✓ 卡尔曼过程噪声提高为 {new_pn:.2e} (响应更快)")
-                    else:
-                        # EMA滤波器：提高alpha
-                        current_alpha = self.angle_filter.pitch_filter.alpha
-                        new_alpha = min(0.8, current_alpha + 0.05)
-                        self.angle_filter.pitch_filter.alpha = new_alpha
-                        self.angle_filter.roll_filter.alpha = new_alpha
-                        print(f"✓ 滤波器alpha增加为 {new_alpha:.2f} (响应更快)")
+                    # 卡尔曼滤波器：提高过程噪声（更信任测量）
+                    current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
+                    new_pn = min(1.0, current_pn * 1.2)
+                    self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
+                    print(f"✓ 卡尔曼过程噪声提高为 {new_pn:.2e} (响应更快)")
                 elif key == ord('k'):
-                    # 减小卡尔曼预测时间（仅卡尔曼模式）
-                    if self.use_predictive_kalman:
-                        current_time = self.angle_filter.get_prediction_time_ms()
-                        new_time = max(0, current_time - 20)
-                        self.angle_filter.set_prediction_time_ms(new_time)
-                        print(f"✓ 预测时间减小为 {new_time:.0f}ms")
-                    else:
-                        print("⚠️  当前使用EMA滤波器，预测时间调整仅在卡尔曼模式下有效")
+                    # 减小卡尔曼预测时间
+                    current_time = self.angle_filter.get_prediction_time_ms()
+                    new_time = max(0, current_time - 20)
+                    self.angle_filter.set_prediction_time_ms(new_time)
+                    print(f"✓ 预测时间减小为 {new_time:.0f}ms")
                 elif key == ord('l'):
-                    # 增大卡尔曼预测时间（仅卡尔曼模式）
-                    if self.use_predictive_kalman:
-                        current_time = self.angle_filter.get_prediction_time_ms()
-                        new_time = min(500, current_time + 20)
-                        self.angle_filter.set_prediction_time_ms(new_time)
-                        print(f"✓ 预测时间增大为 {new_time:.0f}ms")
-                    else:
-                        print("⚠️  当前使用EMA滤波器，预测时间调整仅在卡尔曼模式下有效")
+                    # 增大卡尔曼预测时间
+                    current_time = self.angle_filter.get_prediction_time_ms()
+                    new_time = min(500, current_time + 20)
+                    self.angle_filter.set_prediction_time_ms(new_time)
+                    print(f"✓ 预测时间增大为 {new_time:.0f}ms")
                 elif key == ord('m'):
                     # 重置云台姿态记录器
                     self.gimbal_pose.reset()
@@ -1325,17 +1175,13 @@ class AerialTrackingSystem:
                         print(f"增益: {params['gain']:.1f} dB (范围: {params['gain_min']:.1f}-{params['gain_max']:.1f})")
 
                         # 滤波器参数
-                        if self.use_predictive_kalman:
-                            print(f"滤波器: 卡尔曼预测滤波器")
-                            print(f"  预测时间: {self.angle_filter.get_prediction_time_ms():.0f}ms")
-                            pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                            mn = self.angle_filter.kf.measurementNoiseCov[0, 0]
-                            print(f"  过程噪声: {pn:.2e}, 测量噪声: {mn:.2e}")
-                            v_pitch, v_roll = self.angle_filter.get_velocity()
-                            print(f"  当前速度: pitch={v_pitch:.2f}°/s, roll={v_roll:.2f}°/s")
-                        else:
-                            print(f"滤波器: EMA双轴滤波器")
-                            print(f"  Alpha: {self.angle_filter.pitch_filter.alpha:.2f}")
+                        print(f"滤波器: 卡尔曼预测滤波器")
+                        print(f"  预测时间: {self.angle_filter.get_prediction_time_ms():.0f}ms")
+                        pn = self.angle_filter.kf.processNoiseCov[0, 0]
+                        mn = self.angle_filter.kf.measurementNoiseCov[0, 0]
+                        print(f"  过程噪声: {pn:.2e}, 测量噪声: {mn:.2e}")
+                        v_pitch, v_roll = self.angle_filter.get_velocity()
+                        print(f"  当前速度: pitch={v_pitch:.2f}°/s, roll={v_roll:.2f}°/s")
 
                         print(f"死区控制: {'启用' if self.deadzone_enabled else '禁用'}")
                         print(f"  Pitch死区: {self.deadzone_pitch:.2f}°")
@@ -1430,27 +1276,13 @@ if __name__ == "__main__":
 
     # ========== 滤波器参数 ==========
     filter_cfg = config.get('filter', {})
-    filter_type = filter_cfg.get('type', 'predictive_kalman')
-
     # 卡尔曼预测参数
     pk_cfg = filter_cfg.get('predictive_kalman', {})
-    USE_PREDICTIVE_KALMAN = (filter_type == 'predictive_kalman' and pk_cfg.get('enabled', True))
     KALMAN_PREDICTION_TIME_MS = pk_cfg.get('prediction_time_ms', 200.0)
     KALMAN_PROCESS_NOISE = pk_cfg.get('process_noise', 1e-3)
     KALMAN_MEASUREMENT_NOISE = pk_cfg.get('measurement_noise', 1e-1)
-    KALMAN_MAX_RATE_PITCH = pk_cfg.get('max_rate_pitch', 60.0)
-    KALMAN_MAX_RATE_ROLL = pk_cfg.get('max_rate_roll', 60.0)
-
-    # EMA参数（当不使用卡尔曼时）
-    ema_cfg = filter_cfg.get('ema', {})
-    EMA_ALPHA_PITCH = ema_cfg.get('alpha_pitch', 0.3)
-    EMA_ALPHA_ROLL = ema_cfg.get('alpha_roll', 0.3)
-    EMA_MAX_RATE_PITCH = ema_cfg.get('max_rate_pitch', 30.0)
-    EMA_MAX_RATE_ROLL = ema_cfg.get('max_rate_roll', 30.0)
-
-    # 根据滤波器类型选择速率限制
-    MAX_RATE_PITCH = KALMAN_MAX_RATE_PITCH if USE_PREDICTIVE_KALMAN else EMA_MAX_RATE_PITCH
-    MAX_RATE_ROLL = KALMAN_MAX_RATE_ROLL if USE_PREDICTIVE_KALMAN else EMA_MAX_RATE_ROLL
+    MAX_RATE_PITCH = pk_cfg.get('max_rate_pitch', 60.0)
+    MAX_RATE_ROLL = pk_cfg.get('max_rate_roll', 60.0)
 
     # 从标定文件加载
     USE_CALIBRATION_FILE = calib_cfg.get('use_file', False)
@@ -1477,10 +1309,7 @@ if __name__ == "__main__":
     print(f"串口: {SERIAL_PORT} @ {BAUDRATE}")
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
-    if USE_PREDICTIVE_KALMAN:
-        print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
-    else:
-        print(f"滤波器: 一维EMA双轴滤波器")
+    print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
     print("="*60)
 
     try:
@@ -1498,12 +1327,9 @@ if __name__ == "__main__":
             enable_undistort=ENABLE_UNDISTORT,
             camera_exposure=CAMERA_EXPOSURE,
             camera_gain=CAMERA_GAIN,
-            use_predictive_kalman=USE_PREDICTIVE_KALMAN,
             kalman_prediction_time_ms=KALMAN_PREDICTION_TIME_MS,
             kalman_process_noise=KALMAN_PROCESS_NOISE,
             kalman_measurement_noise=KALMAN_MEASUREMENT_NOISE,
-            ema_alpha_pitch=EMA_ALPHA_PITCH,
-            ema_alpha_roll=EMA_ALPHA_ROLL,
             max_rate_pitch=MAX_RATE_PITCH,
             max_rate_roll=MAX_RATE_ROLL,
             enable_velocity_feedforward=ENABLE_VELOCITY_FEEDFORWARD
@@ -1530,11 +1356,8 @@ if __name__ == "__main__":
         print("\n按键说明:")
         print("  q - 退出程序")
         print("  r - 重置跟踪状态")
-        if USE_PREDICTIVE_KALMAN:
-            print("  a/s - 降低/提高过程噪声（更平滑/响应更快）")
-            print("  k/l - 减小/增大预测时间（±20ms）")
-        else:
-            print("  a/s - 降低/提高alpha（更平滑/响应更快）")
+        print("  a/s - 降低/提高过程噪声（更平滑/响应更快）")
+        print("  k/l - 减小/增大预测时间（±20ms）")
         print("  d - 切换死区控制开关")
         print("  z/x - 减小/增大死区阈值")
         print("  m - 重置云台姿态记录（重新以当前为初始）")

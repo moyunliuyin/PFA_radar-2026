@@ -54,9 +54,9 @@ roi:
 
 # 滤波器配置
 filter:
-  type: 'predictive_kalman'    # 滤波器类型：'ema_1d'（一维EMA）或 'predictive_kalman'（卡尔曼预测）
+  type: 'predictive_kalman'    # 滤波器类型：predictive_kalman（卡尔曼预测）
 
-  # 卡尔曼预测滤波器配置（推荐使用，有延迟补偿）
+  # 卡尔曼预测滤波器配置（带延迟补偿）
   predictive_kalman:
     enabled: true               # 是否启用卡尔曼预测滤波器
     prediction_time_ms: 100.0   # 预测补偿时间（毫秒）- 降低以减少过冲
@@ -66,19 +66,12 @@ filter:
     max_rate_roll: 60.0         # roll最大速率限制（度/秒）
     # 调整：运行时按 k/l 键调整预测时间（±20ms）
 
-  # EMA滤波器配置（备用）
-  ema:
-    alpha_pitch: 0.15           # pitch轴平滑系数（降低响应速度，减少过冲）
-    alpha_roll: 0.15            # roll轴平滑系数（降低响应速度，减少过冲）
-    max_inactive_time: 2.0      # 最大不活跃时间（秒），超时重置
-    max_rate_pitch: 30.0        # pitch轴最大变化速率（度/秒）- 降低以避免快速累积
-    max_rate_roll: 30.0         # roll轴最大变化速率（度/秒）- 降低以避免快速累积
-
 # 死区控制配置
 deadzone:
   enabled: true                 # 是否启用死区控制
-  pitch: 0.9                    # pitch轴死区阈值（度）- 增大以减少频繁调整和抖动
+  pitch: 0.9                    # pitch轴死区阈值（度）- 增大以减少频繁调整
   roll: 0.8                     # roll轴死区阈值（度）- 增大以减少频繁调整
+  visual_radius: 50             # 死区可视化半径（像素），画面上的绿色圈
 
 # 帧间隔控制配置
 frame_interval:
