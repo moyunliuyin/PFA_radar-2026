@@ -11,7 +11,7 @@ warnings.filterwarnings('ignore', message='.*torch.cuda.amp.autocast.*')
 # 导入独立的串口通信模块
 from serial_comm import create_serial
 
-# 导入雷达检测器
+# 导入YOLO检测器
 from detect_function import YOLOv5Detector
 
 # 导入海康相机接口
@@ -244,10 +244,12 @@ class PredictiveKalmanFilter:
         measurement = np.array([[pitch_deg], [roll_deg]], dtype=np.float32)
         self.kf.correct(measurement)
 
-        # 自适应调整过程噪声（基于速度）
+        # 自适应调整过程噪声（基于速度）- pitch轴使用更保守的增益
         v_pitch = abs(self.kf.statePost[2, 0])
         v_roll = abs(self.kf.statePost[3, 0])
-        self.kf.processNoiseCov[2, 2] = min(0.5, 1e-3 + v_pitch / 100.0)
+        # pitch轴：降低速度对噪声的影响（除以200而不是100），减少抖动
+        self.kf.processNoiseCov[2, 2] = min(0.3, 1e-3 + v_pitch / 200.0)
+        # roll轴：保持原有响应性
         self.kf.processNoiseCov[3, 3] = min(0.5, 1e-3 + v_roll / 100.0)
 
         # 向前预测补偿延迟
@@ -505,15 +507,22 @@ class HikCameraCapture:
             print("相机已释放")
 
 
-class ArmorTrackingSystem:
-    """装甲板跟踪系统
+class AerialTrackingSystem:
+    """无人机激光检测模块跟踪系统
     
-    优化特点：
-    1. 检测策略：先直接检测装甲板，失败后再检测车辆ROI
-    2. 滤波器：使用一维EMA滤波器独立平滑pitch和roll角度
-    3. 角度模式：累积计算绝对偏转角度发送至下位机
+    核心目标：检测并跟踪无人机上的激光检测模块
+    
+    检测策略（双层）：
+    1. 直接全图检测激光模块（当前启用）
+    2. 先检测无人机 → 再在ROI中检测激光模块（已注释，可恢复）
+    
+    滤波器：卡尔曼/EMA滤波器平滑pitch和roll角度
+    角度模式：累积计算绝对偏转角度发送至下位机
+    应用场景：地面站云台跟踪空中无人机的激光检测模块
+    
+    当前测试：使用 yolov5s.pt + apple class 临时测试直接检测功能
     """
-    def __init__(self, vehicle_model_path, armor_model_path,
+    def __init__(self, aerial_model_path=None, laser_module_model_path=None,
                  serial_port='COM8', baudrate=115200, use_gpu=True,
                  camera_fx=15989.09, camera_fy=15985.61,
                  camera_cx=None, camera_cy=None,
@@ -564,36 +573,55 @@ class ArmorTrackingSystem:
         else:
             print(f"畸变校正: 禁用")
         
-        # 加载模型
+        # 加载检测模型
         print("加载检测模型...")
+
+        # 双层检测策略：
+        # 1. 直接全图检测激光模块（当前启用）
+        # 2. 先检测无人机 → 再在无人机ROI中检测激光模块（已注释）
         
-        # 车辆检测器（优化参数以提高检测精度）
-        self.vehicle_detector = YOLOv5Detector(
-            weights_path=vehicle_model_path,
-            img_size=(640, 640), 
-            conf_thres=0.1, 
-            iou_thres=0.5,  # 标准NMS阈值
-            max_det=14, 
-            device=self.device_str,
-            data='yaml/car.yaml',
-            ui=True  # 打开UI绘制，便于调试与可视化
-        )
+        # 无人机检测器（用于第二层检测策略，当前已关闭）
+        # 如需启用：取消注释下方代码，并恢复 detect_laser_module() 中对应逻辑
+        self.aerial_detector = None
+        # self.vehicle_detector = YOLOv5Detector(
+        #     weights_path=vehicle_model_path,
+        #     img_size=(640, 640),
+        #     conf_thres=0.1,
+        #     iou_thres=0.5,
+        #     max_det=14,
+        #     device=self.device_str,
+        #     data='yaml/car.yaml',
+        #     ui=True
+        # )
         
-        # 装甲板检测器（平衡精度与召回率）
-        self.armor_detector = YOLOv5Detector(
-            weights_path=armor_model_path,
-            img_size=(384, 384),  # 保持原始尺寸
-            conf_thres=0.1, 
-            iou_thres=0.4, 
-            max_det=1,
+        # self.aerial_detector = YOLOv5Detector(
+        #     weights_path=aerial_model_path,
+        #     img_size=(640, 640),
+        #     conf_thres=0.1,
+        #     iou_thres=0.5,
+        #     max_det=5,
+        #     device=self.device_str,
+        #     data='yaml/aerial.yaml',  # 未来使用无人机检测配置
+        #     ui=True
+        # )
+        
+        # 激光检测模块检测器（核心目标）
+        # 当前使用 yolov5s.pt + apple class 临时测试
+        # 未来替换为专用激光模块检测模型（laser_module.pt）
+        self.laser_module_detector = YOLOv5Detector(
+            weights_path=laser_module_model_path,
+            img_size=(640, 640),  # 激光模块目标尺寸适中
+            conf_thres=0.25,
+            iou_thres=0.45, 
+            max_det=1,  # 只跟踪单个目标
             device=self.device_str,
-            data='yaml/armor.yaml',
+            data='apple_coco.yaml',  # 临时使用COCO配置（apple class 47）
+            classes=[47],  # 临时测试：apple → 未来改为 laser_module
             ui=True
         )
         
         print(f"✓ 模型加载完成")
-        print(f"  车辆模型: {vehicle_model_path}")
-        print(f"  装甲板模型: {armor_model_path}")
+        print(f"  激光模块检测模型: {laser_module_model_path} (临时使用apple class测试)")
         
         # 初始化海康相机
         print("初始化海康相机...")
@@ -680,8 +708,8 @@ class ArmorTrackingSystem:
         self.detect_time = 0
         self.total_frames = 0
         self.detect_success_count = 0
-        self.vehicle_detect_count = 0
-        self.armor_detect_count = 0
+        self.aerial_detect_count = 0  # 无人机检测计数（第二层策略用）
+        self.laser_module_detect_count = 0  # 激光模块检测计数
         
         # 目标跟踪ID
         self.target_id = 0
@@ -693,8 +721,14 @@ class ArmorTrackingSystem:
         self.gimbal_pose = GimbalPoseRecorder()
         print("✓ 云台姿态记录器已启用（发送绝对角度）")
         
-    def detect_vehicle_and_armor(self, frame):
-        """检测策略：先直接检测装甲板，失败后再检测车辆->ROI检测装甲板
+    def detect_laser_module(self, frame):
+        """检测激光检测模块
+        
+        双层检测策略：
+        1. 直接全图检测激光模块（当前启用）
+        2. 先检测无人机 → 再在无人机ROI中检测激光模块（已注释）
+        
+        当前使用apple class临时测试，未来替换为专用laser_module模型
         """
         detect_start = time.time()
         
@@ -702,16 +736,16 @@ class ArmorTrackingSystem:
         if self.frame_center is None:
             self.frame_center = (w // 2, h // 2)
     
-        best_armor = None
+        best_laser_module = None
         best_conf = 0
         
-        #直接全图检测装甲板
+        # 策略1：直接全图检测激光模块（当前启用）
         try:
-            armor_results = self.armor_detector.predict(frame)
+            laser_results = self.laser_module_detector.predict(frame)
             
-            for armor_detection in armor_results:
-                armor_cls, armor_xywh, armor_conf = armor_detection
-                ax, ay, aw, ah = armor_xywh
+            for detection in laser_results:
+                module_cls, module_xywh, module_conf = detection
+                ax, ay, aw, ah = module_xywh
                 
                 abs_x1 = int(ax)
                 abs_y1 = int(ay)
@@ -721,98 +755,93 @@ class ArmorTrackingSystem:
                 center_x = (abs_x1 + abs_x2) // 2
                 center_y = (abs_y1 + abs_y2) // 2
                 
-                self.armor_detect_count += 1
+                self.laser_module_detect_count += 1
                 
-                if armor_conf > best_conf:
-                    best_armor = {
+                if module_conf > best_conf:
+                    best_laser_module = {
                         'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
                         'center': (center_x, center_y),
-                        'conf': float(armor_conf),
-                        'vehicle_bbox': None,
-                        'vehicle_conf': 0.0,
-                        'class': armor_cls,
-                        'detect_method': 'direct'  # 标记检测方式
+                        'conf': float(module_conf),
+                        'aerial_bbox': None,  # 预留：无人机框（第二层策略用）
+                        'aerial_conf': 0.0,
+                        'class': module_cls,
+                        'detect_method': 'direct'  # 直接检测
                     }
-                    best_conf = float(armor_conf)
+                    best_conf = float(module_conf)
         except Exception:
             pass
         
         # 如果直接检测成功，直接返回
-        if best_armor is not None:
+        if best_laser_module is not None:
             self.detect_time = time.time() - detect_start
-            return best_armor
+            return best_laser_module
         
-        #检测车辆 -> ROI检测装甲板 
-        vehicle_results = self.vehicle_detector.predict(frame)
+        # ===== 策略2：先检测无人机 → 再检测激光模块（已关闭）=====
+        # if self.aerial_detector:
+        #     aerial_results = self.aerial_detector.predict(frame)
+        #     for detection in aerial_results:
+        #         cls, xywh, conf = detection
+        #         if cls == 'aerial':  # 检测到无人机
+        #             # 在无人机ROI中检测激光模块
+        #             # ... (ROI裁剪和激光模块检测逻辑)
+        #             pass
+        # vehicle_results = self.vehicle_detector.predict(frame)
+        # for detection in vehicle_results:
+        #     cls, xywh, conf = detection
+        #     if cls == 'car':
+        #         self.vehicle_detect_count += 1
+        #         left, top, w_box, h_box = xywh
+        #         left, top, w_box, h_box = int(left), int(top), int(w_box), int(h_box)
+        #
+        #         expand_ratio = 0.15
+        #         expand_x = int(w_box * expand_ratio)
+        #         expand_y = int(h_box * expand_ratio)
+        #
+        #         x1 = max(0, left - expand_x)
+        #         y1 = max(0, top - expand_y)
+        #         x2 = min(w, left + w_box + expand_x)
+        #         y2 = min(h, top + h_box + expand_y)
+        #
+        #         roi_w = x2 - x1
+        #         roi_h = y2 - y1
+        #         if roi_w < 20 or roi_h < 20:
+        #             continue
+        #
+        #         vehicle_roi = frame[y1:y2, x1:x2]
+        #         if vehicle_roi.size == 0:
+        #             continue
+        #
+        #         armor_results = self.armor_detector.predict(vehicle_roi)
+        #         for armor_detection in armor_results:
+        #             armor_cls, armor_xywh, armor_conf = armor_detection
+        #             self.armor_detect_count += 1
+        #             ax, ay, aw, ah = armor_xywh
+        #
+        #             abs_x1 = x1 + int(ax)
+        #             abs_y1 = y1 + int(ay)
+        #             abs_x2 = abs_x1 + int(aw)
+        #             abs_y2 = abs_y1 + int(ah)
+        #
+        #             center_x = (abs_x1 + abs_x2) // 2
+        #             center_y = (abs_y1 + abs_y2) // 2
+        #
+        #             if armor_conf > best_conf:
+        #                 best_armor = {
+        #                     'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
+        #                     'center': (center_x, center_y),
+        #                     'conf': float(armor_conf),
+        #                     'vehicle_bbox': (left, top, left + w_box, top + h_box),
+        #                     'vehicle_conf': float(conf),
+        #                     'class': armor_cls,
+        #                     'detect_method': 'vehicle_roi'
+        #                 }
+        #                 best_conf = float(armor_conf)
+        #
+        # if best_armor is not None:
+        #     self.detect_time = time.time() - detect_start
+        #     return best_armor
         
-        for detection in vehicle_results:
-            cls, xywh, conf = detection
-            
-            if cls == 'car':
-                self.vehicle_detect_count += 1
-                left, top, w_box, h_box = xywh
-                left, top, w_box, h_box = int(left), int(top), int(w_box), int(h_box)
-                
-                # ROI扩展策略：向外扩展15%以包含边缘装甲板
-                expand_ratio = 0.15
-                expand_x = int(w_box * expand_ratio)
-                expand_y = int(h_box * expand_ratio)
-                
-                # 确保ROI在图像范围内
-                x1 = max(0, left - expand_x)
-                y1 = max(0, top - expand_y)
-                x2 = min(w, left + w_box + expand_x)
-                y2 = min(h, top + h_box + expand_y)
-                
-                # 检查ROI是否有效
-                roi_w = x2 - x1
-                roi_h = y2 - y1
-                if roi_w < 20 or roi_h < 20:
-                    continue
-                
-                # 裁剪车辆区域
-                vehicle_roi = frame[y1:y2, x1:x2]
-                
-                if vehicle_roi.size == 0:
-                    continue
-                
-                # 在车辆ROI中检测装甲板
-                armor_results = self.armor_detector.predict(vehicle_roi)
-                
-                for armor_detection in armor_results:
-                    armor_cls, armor_xywh, armor_conf = armor_detection
-                    
-                    self.armor_detect_count += 1
-                    ax, ay, aw, ah = armor_xywh
-                    
-                    # 转换到原图坐标
-                    abs_x1 = x1 + int(ax)
-                    abs_y1 = y1 + int(ay)
-                    abs_x2 = abs_x1 + int(aw)
-                    abs_y2 = abs_y1 + int(ah)
-                    
-                    center_x = (abs_x1 + abs_x2) // 2
-                    center_y = (abs_y1 + abs_y2) // 2
-                    
-                    if armor_conf > best_conf:
-                        best_armor = {
-                            'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
-                            'center': (center_x, center_y),
-                            'conf': float(armor_conf),
-                            'vehicle_bbox': (left, top, left + w_box, top + h_box),
-                            'vehicle_conf': float(conf),
-                            'class': armor_cls,
-                            'detect_method': 'vehicle_roi'
-                        }
-                        best_conf = float(armor_conf)
-        
-        # 如果通过车辆ROI检测成功，返回结果
-        if best_armor is not None:
-            self.detect_time = time.time() - detect_start
-            return best_armor
-        
-        # 在上一帧位置附近搜索
-        # 目标短暂丢失时的恢复策略
+        # 在上一帧位置附近搜索（目标短暂丢失时的恢复策略）
         if self.last_target_pos is not None:
             search_x, search_y = self.last_target_pos
             search_size = 200  # 搜索区域大小
@@ -824,11 +853,11 @@ class ArmorTrackingSystem:
             
             if sx2 - sx1 >= 40 and sy2 - sy1 >= 40:
                 search_roi = frame[sy1:sy2, sx1:sx2]
-                armor_results = self.armor_detector.predict(search_roi)
+                module_results = self.laser_module_detector.predict(search_roi)
                 
-                for armor_detection in armor_results:
-                    armor_cls, armor_xywh, armor_conf = armor_detection
-                    ax, ay, aw, ah = armor_xywh
+                for module_detection in module_results:
+                    module_cls, module_xywh, module_conf = module_detection
+                    ax, ay, aw, ah = module_xywh
                     
                     abs_x1 = sx1 + int(ax)
                     abs_y1 = sy1 + int(ay)
@@ -838,21 +867,21 @@ class ArmorTrackingSystem:
                     center_x = (abs_x1 + abs_x2) // 2
                     center_y = (abs_y1 + abs_y2) // 2
                     
-                    if armor_conf > best_conf:
-                        best_armor = {
+                    if module_conf > best_conf:
+                        best_laser_module = {
                             'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
                             'center': (center_x, center_y),
-                            'conf': float(armor_conf),
-                            'vehicle_bbox': None,
-                            'vehicle_conf': 0.0,
-                            'class': armor_cls,
+                            'conf': float(module_conf),
+                            'aerial_bbox': None,
+                            'aerial_conf': 0.0,
+                            'class': module_cls,
                             'detect_method': 'search_roi'
                         }
-                        best_conf = float(armor_conf)
+                        best_conf = float(module_conf)
 
         # 记录检测耗时并返回最佳结果
         self.detect_time = time.time() - detect_start
-        return best_armor
+        return best_laser_module
     
     def undistort_point(self, pixel_x, pixel_y):
         """
@@ -922,6 +951,27 @@ class ArmorTrackingSystem:
         if self.enable_velocity_feedforward and self.use_predictive_kalman:
             # 估计速度
             v_pitch, v_roll = self.angle_filter.get_velocity()
+            
+            # 速度衰减机制：当角度变化很小时（接近目标中心），降低速度前馈增益
+            # 避免在中心位置因速度前馈过度补偿导致来回晃动
+            pitch_change_current = abs(delta_pitch_deg)
+            roll_change_current = abs(delta_roll_deg)
+            
+            # 定义衰减区域：当角度偏差小于阈值时开始衰减
+            decay_threshold_pitch = 2.0  # 度
+            decay_threshold_roll = 2.0   # 度
+            
+            # 计算衰减因子（0-1之间，越接近中心越小）
+            if pitch_change_current < decay_threshold_pitch:
+                pitch_decay_factor = pitch_change_current / decay_threshold_pitch
+                # 使用平方衰减，更激进地抑制小角度时的速度
+                pitch_decay_factor = pitch_decay_factor ** 2
+                v_pitch *= pitch_decay_factor
+            
+            if roll_change_current < decay_threshold_roll:
+                roll_decay_factor = roll_change_current / decay_threshold_roll
+                roll_decay_factor = roll_decay_factor ** 2
+                v_roll *= roll_decay_factor
 
         # 死区控制
         # 计算与上次发送角度的差值
@@ -990,8 +1040,9 @@ class ArmorTrackingSystem:
     def run(self):
         """主运行循环"""
         print("开始跟踪...")
-        print("检测策略: 先直接检测装甲板 -> 失败后车辆ROI检测")
-        print("角度滤波: 一维EMA滤波器（防止云台抖动）")
+        print("检测目标: 无人机激光检测模块")
+        print("检测策略: 直接全图检测 (临时使用apple class测试)")
+        print("角度滤波: 卡尔曼/EMA滤波器（防止云台抖动）")
         print(f"帧间隔: 每{self.frame_interval}帧检测发送一次")
         
         try:
@@ -1015,20 +1066,20 @@ class ArmorTrackingSystem:
                 if self.interval_enabled and self.frame_interval > 1:
                     should_detect = (self.frame_counter % self.frame_interval == 0)
                 
-                # 检测装甲板（根据帧间隔决定）
+                # 检测激光模块（根据帧间隔决定）
                 if should_detect:
-                    armor = self.detect_vehicle_and_armor(frame)
-                    self.last_detection_result = armor  # 缓存结果
+                    laser_module = self.detect_laser_module(frame)
+                    self.last_detection_result = laser_module  # 缓存结果
                 else:
-                    armor = self.last_detection_result  # 使用缓存结果（仅用于显示）
+                    laser_module = self.last_detection_result  # 使用缓存结果（仅用于显示）
                 
-                if armor:
+                if laser_module:
                     # 只在检测帧统计成功次数
                     if should_detect:
                         self.detect_success_count += 1
                     
-                    # 获取装甲板中心
-                    center = armor['center']
+                    # 获取激光模块中心
+                    center = laser_module['center']
                     
                     # 只在检测帧进行跟踪更新和发送
                     if should_detect:
@@ -1103,27 +1154,28 @@ class ArmorTrackingSystem:
                             roll_deg_filtered = roll_deg_raw = 0
                             pixel_offset_x = pixel_offset_y = 0
                     
-                    # 可视化 - 绘制车辆框（蓝色）
-                    if armor.get('vehicle_bbox') is not None:
-                        vx1, vy1, vx2, vy2 = armor['vehicle_bbox']
-                        cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (255, 0, 0), 2)
-                        cv2.putText(frame, f"Car {armor['vehicle_conf']:.2f}", 
-                                  (vx1, vy1-10), cv2.FONT_HERSHEY_SIMPLEX, 
+                    # 可视化 - 绘制检测框
+                    # 无人机框（第二层策略用，当前未启用）
+                    if laser_module.get('aerial_bbox') is not None:
+                        ax1, ay1, ax2, ay2 = laser_module['aerial_bbox']
+                        cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (255, 0, 0), 2)
+                        cv2.putText(frame, f"Aerial {laser_module['aerial_conf']:.2f}", 
+                                  (ax1, ay1-10), cv2.FONT_HERSHEY_SIMPLEX, 
                                   0.5, (255, 0, 0), 4)
                     
-                    # 绘制装甲板框（绿色）
-                    bbox = armor['bbox']
+                    # 绘制激光模块检测框（绿色）
+                    bbox = laser_module['bbox']
                     cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), 
                                 (0, 255, 0), 4)
                     
-                    # 显示检测方式和装甲板标签
-                    detect_method = armor.get('detect_method', 'unknown')
+                    # 显示激光模块标签
+                    detect_method = laser_module.get('detect_method', 'unknown')
                     method_color = (0, 255, 0) if detect_method == 'direct' else (255, 165, 0)
-                    cv2.putText(frame, f"Armor [{detect_method}]", 
+                    cv2.putText(frame, "laser_module", 
                               (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 
                               0.6, method_color, 2)
                     
-                    # 装甲板中心点（红色）
+                    # 激光模块中心点（红色）
                     cv2.circle(frame, center, 5, (0, 0, 255), -1)
                     
                     # # 绘制轨迹
@@ -1141,7 +1193,7 @@ class ArmorTrackingSystem:
                     cv2.putText(frame, f"Offset: ({pixel_offset_x:.0f}, {pixel_offset_y:.0f})", 
                               (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
                               (150, 150, 150), 2)
-                    cv2.putText(frame, f"Conf: {armor['conf']:.2f}", 
+                    cv2.putText(frame, f"Conf: {laser_module['conf']:.2f}", 
                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
                               (0, 255, 255), 2)
                 else:
@@ -1179,44 +1231,25 @@ class ArmorTrackingSystem:
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
                 cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 210), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f"Filter: EMA (1D)", (10, 240), 
+                
+                # 动态显示滤波器类型
+                filter_type = "Kalman-Pred" if self.use_predictive_kalman else "EMA (1D)"
+                cv2.putText(frame, f"Filter: {filter_type}", (10, 240), 
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # 帧间隔显示
-                interval_status = f"Interval: {self.frame_interval}" if self.interval_enabled else "Interval: OFF"
-                detect_indicator = " [DETECT]" if should_detect else ""
-                cv2.putText(frame, interval_status + detect_indicator, (10, 270), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
-                
-                # 统计信息
-                success_rate = (self.detect_success_count / self.total_frames * 100) if self.total_frames > 0 else 0
-                cv2.putText(frame, f"Success: {success_rate:.1f}%", (10, 300), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.putText(frame, f"Vehicles: {self.vehicle_detect_count}", (10, 330), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-                cv2.putText(frame, f"Armors: {self.armor_detect_count}", (10, 360), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
                 
                 # 显示云台绝对姿态
                 pose_pitch, pose_roll = self.gimbal_pose.get_pose()
-                cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 390),
+                cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 270),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
                 
                 # 显示
-                cv2.imshow('Armor Tracking System', frame)
+                cv2.imshow('Laser Module Tracking System', frame)
                 
                 # 按键控制
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     print("用户按下 'q'，退出程序")
                     break
-                elif key == ord('r'):
-                    print("重置跟踪和滤波器")
-                    self.track_initialized = False
-                    self.trajectory.clear()
-                    self.angle_filter.reset()
-                    self.target_lost_frames = 0
-                    self.last_target_pos = None
                 elif key == ord('a'):
                     # 调整滤波器参数（增加平滑度）
                     if self.use_predictive_kalman:
@@ -1299,11 +1332,6 @@ class ArmorTrackingSystem:
                         print(f"帧间隔控制: {'启用' if self.interval_enabled else '禁用'}")
                         print(f"  检测间隔: 每{self.frame_interval}帧")
                         print("==================")
-                elif key == ord('d'):
-                    # 切换死区控制开关
-                    self.deadzone_enabled = not self.deadzone_enabled
-                    status = "启用" if self.deadzone_enabled else "禁用"
-                    print(f"✓ 死区控制已{status}")
                 elif key == ord('z'):
                     # 减小死区阈值
                     self.deadzone_pitch = max(0.02, self.deadzone_pitch - 0.02)
@@ -1314,19 +1342,6 @@ class ArmorTrackingSystem:
                     self.deadzone_pitch = min(1.0, self.deadzone_pitch + 0.02)
                     self.deadzone_roll = min(1.0, self.deadzone_roll + 0.02)
                     print(f"✓ 死区阈值增大: pitch={self.deadzone_pitch:.2f}°, roll={self.deadzone_roll:.2f}°")
-                elif key == ord('i'):
-                    # 切换帧间隔控制开关
-                    self.interval_enabled = not self.interval_enabled
-                    status = "启用" if self.interval_enabled else "禁用"
-                    print(f"✓ 帧间隔控制已{status} (当前间隔: {self.frame_interval}帧)")
-                elif key == ord(','):
-                    # 减小帧间隔（更频繁检测）
-                    self.frame_interval = max(1, self.frame_interval - 1)
-                    print(f"✓ 帧间隔减小为 {self.frame_interval} (每{self.frame_interval}帧检测一次)")
-                elif key == ord('.'):
-                    # 增大帧间隔（给云台更多调整时间）
-                    self.frame_interval = min(30, self.frame_interval + 1)
-                    print(f"✓ 帧间隔增大为 {self.frame_interval} (每{self.frame_interval}帧检测一次)")
                 elif key == ord('+') or key == ord('='):
                     # 增加曝光时间
                     new_exposure = self.camera.exposure_time * 1.2
@@ -1357,7 +1372,7 @@ class ArmorTrackingSystem:
         """清理资源"""
         print("\n清理资源...")
         print(f"总帧数: {self.total_frames}")
-        print(f"检测成功: {self.detect_success_count}")
+        print(f"激光模块检测成功: {self.detect_success_count}")
         if self.total_frames > 0:
             print(f"成功率: {self.detect_success_count/self.total_frames*100:.1f}%")
         self.camera.release()
@@ -1379,7 +1394,8 @@ if __name__ == "__main__":
         config = {}
 
     # 配置参数 ===========================
-    VEHICLE_MODEL = config.get('models', {}).get('vehicle', 'models/car.pt')
+    # 单模型模式：不需要车辆模型
+    VEHICLE_MODEL = config.get('models', {}).get('vehicle', None)
     ARMOR_MODEL = config.get('models', {}).get('armor', 'models/armor.pt')
     SERIAL_PORT = config.get('serial', {}).get('port', 'COM8')
     BAUDRATE = config.get('serial', {}).get('baudrate', 115200)
@@ -1442,13 +1458,13 @@ if __name__ == "__main__":
             print("   使用默认参数")
     
     print("="*60)
-    print(" 装甲板跟踪系统 v2.0 - 卡尔曼预测版 ")
+    print(" 无人机激光模块跟踪系统 v2.0 - 卡尔曼预测版 ")
     print("="*60)
-    print(f"车辆模型: {VEHICLE_MODEL}")
-    print(f"装甲板模型: {ARMOR_MODEL}")
+    print(f"无人机检测模型: {'(未启用)' if not VEHICLE_MODEL else VEHICLE_MODEL}")
+    print(f"激光模块检测模型: {ARMOR_MODEL} (临时使用apple测试)")
     print(f"串口: {SERIAL_PORT} @ {BAUDRATE}")
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
-    print(f"检测策略: 先装甲板 -> 失败后车辆ROI")
+    print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
     if USE_PREDICTIVE_KALMAN:
         print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
     else:
@@ -1456,9 +1472,9 @@ if __name__ == "__main__":
     print("="*60)
 
     try:
-        tracker = ArmorTrackingSystem(
-            vehicle_model_path=VEHICLE_MODEL,
-            armor_model_path=ARMOR_MODEL,
+        tracker = AerialTrackingSystem(
+            aerial_model_path=VEHICLE_MODEL,  # 无人机检测模型（未使用）
+            laser_module_model_path=ARMOR_MODEL,  # 激光模块检测模型
             serial_port=SERIAL_PORT,
             baudrate=BAUDRATE,
             use_gpu=USE_GPU,

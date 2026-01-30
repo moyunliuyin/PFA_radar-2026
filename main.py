@@ -77,6 +77,9 @@ key_modifiable = -1  # 密钥是否可修改
 chances_flag = 1  # 双倍易伤触发标志位，需要从1递增，每小局比赛会重置，所以每局比赛要重启程序
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
 
+# 距离触发双倍易伤相关
+distance_check_buffer = deque(maxlen=2)  # 存储最近2帧的距离判断结果
+
 # 加载战场地图
 map = map_backup.copy()
 
@@ -617,6 +620,45 @@ def ser_send():
         return guess_table.get(send_name)[guess_index.get(send_name)][0], \
             guess_table.get(send_name)[guess_index.get(send_name)][1]
 
+    # 定义距离触发检查函数
+    def check_distance_trigger():
+        """检查己方有输出的机器人与任意敌方机器人的距离是否满足触发条件"""
+        # 己方有输出的机器人：英雄 + 步兵 + 哨兵
+        our_output_robots = ['R1', 'R2', 'R3', 'R4', 'R5', 'R7'] if state == 'R' else ['B1', 'B2', 'B3', 'B4', 'B5', 'B7']
+        # 敌方所有机器人
+        enemy_robots = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'] if state == 'R' else ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7']
+        
+        # 遍历己方所有输出机器人
+        for our_robot in our_output_robots:
+            # 排除完全未检测到的机器人（send_map为(0,0)）
+            if send_map[our_robot] == (0, 0):
+                continue
+            # 排除正在使用盲区预测点的机器人
+            # 注意：哨兵在盲区时，send_map会存储预测点坐标（非真实位置），必须排除
+            if guess_list.get(our_robot, True):
+                continue
+            
+            # 遍历所有敌方机器人
+            for enemy in enemy_robots:
+                # 排除完全未检测到的敌方机器人
+                if send_map[enemy] == (0, 0):
+                    continue
+                # 排除正在使用盲区预测点的敌方机器人（预测点不准确，不能用于距离判断）
+                if guess_list.get(enemy, True):
+                    continue
+                
+                # 计算距离（坐标单位是cm，转换为米）
+                dx = (send_map[our_robot][0] - send_map[enemy][0]) / 100.0
+                dy = (send_map[our_robot][1] - send_map[enemy][1]) / 100.0
+                distance = np.sqrt(dx**2 + dy**2)
+                
+                # 距离阈值：2.5米（考虑延迟补偿）
+                if distance < 2.5:
+                    print(f"距离满足条件: {our_robot} vs {enemy}, 距离={distance:.2f}米")
+                    return True
+        
+        return False
+    
     time_s = time.time()
     target_last = 0  # 上一帧的飞镖目标
     update_time = 0  # 上次预测点更新时间
@@ -752,7 +794,7 @@ def ser_send():
                     time_e = time.time()
                     # 发送时间间隔为10秒
                     if time_e - time_s > 10:
-                        print("请求双倍触发")
+                        print("飞镖触发：请求双倍易伤")
                         data = build_data_decision(chances_flag, state)
                         packet, seq = build_send_packet(data, seq, [0x03, 0x01])
                         # print(packet.hex(),chances_flag,state)
@@ -764,6 +806,31 @@ def ser_send():
                             chances_flag = 1
 
                         time_s = time.time()
+            
+            # 基于距离的双倍易伤触发判断
+            distance_trigger_now = check_distance_trigger()
+            distance_check_buffer.append(distance_trigger_now)
+            
+            # 连续2帧都满足距离条件才触发（防止检测抖动）
+            if len(distance_check_buffer) >= 2 and all(distance_check_buffer):
+                # 有双倍易伤机会，并且当前没有在双倍易伤
+                if double_vulnerability_chance > 0 and opponent_double_vulnerability == 0:
+                    time_e = time.time()
+                    # 共享10秒防抖
+                    if time_e - time_s > 10:
+                        print("距离触发：请求双倍易伤")
+                        data = build_data_decision(chances_flag, state)
+                        packet, seq = build_send_packet(data, seq, [0x03, 0x01])
+                        ser1.write(packet)
+                        print("距离触发成功", chances_flag)
+                        # 更新标志位
+                        chances_flag += 1
+                        if chances_flag >= 3:
+                            chances_flag = 1
+                        
+                        time_s = time.time()
+                        # 触发后清空缓冲区，避免连续触发
+                        distance_check_buffer.clear()
         except Exception as r:
             print('未知错误 %s' % (r))
 
