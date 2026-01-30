@@ -676,14 +676,15 @@ class AerialTrackingSystem:
             print(f"✓ 速度前馈已禁用（仅发送位置，8字节）")
 
         # 死区控制参数
-        # 当角度变化量小于死区阈值时，不发送指令，避免云台频繁微调抖动
+        # 当角度变化量小于死区阈值时，保持上次角度不变（保持姿态），速度设为0
         self.deadzone_pitch = 0.1  # pitch轴死区（度）
         self.deadzone_roll = 0.1   # roll轴死区（度）
         self.last_sent_pitch = 0.0  # 上次发送的pitch角度
         self.last_sent_roll = 0.0   # 上次发送的roll角度
         self.deadzone_enabled = True  # 死区控制开关
         self.deadzone_skip_count = 0  # 跳过发送的计数（用于统计）
-        print(f"✓ 死区控制已启用 (pitch={self.deadzone_pitch}°, roll={self.deadzone_roll}°)")
+        self.deadzone_visual_radius = 50  # 死区可视化半径（像素），用于画面显示
+        print(f"✓ 死区控制已启用 (pitch={self.deadzone_pitch}°, roll={self.deadzone_roll}°, 可视半径={self.deadzone_visual_radius}px)")
         
         # 每隔N帧才进行检测和发送，预留云台调整姿态的时间
         self.frame_interval = 3       # 检测间隔（每N帧检测一次），1=每帧都检测
@@ -932,7 +933,7 @@ class AerialTrackingSystem:
         初始姿态的绝对角度后发送。发送顺序: pitch在前，roll在后。
 
         如果启用速度前馈，同时发送角速度信息到下位机用于前馈控制。
-        死区控制：当角度变化量小于阈值时跳过发送，减少云台微调抖动。
+        死区控制：当角度变化量小于阈值时，保持上次角度不变，速度设为0。
         """
         import math
         # 将弧度转换为角度
@@ -973,23 +974,28 @@ class AerialTrackingSystem:
                 roll_decay_factor = roll_decay_factor ** 2
                 v_roll *= roll_decay_factor
 
-        # 死区控制
+        # 死区控制：变化量小时保持上次角度不变，速度设为0
         # 计算与上次发送角度的差值
         pitch_change = abs(send_pitch - self.last_sent_pitch)
         roll_change = abs(send_roll - self.last_sent_roll)
-
-        # 如果启用死区控制，且两轴变化都在死区内，则跳过本次发送
+        
+        in_deadzone = False
         if self.deadzone_enabled:
             if pitch_change < self.deadzone_pitch and roll_change < self.deadzone_roll:
+                in_deadzone = True
                 self.deadzone_skip_count += 1
-                # 每100次跳过打印一次统计
+                # 保持上次的角度（保持姿态不动），速度设为0
+                send_pitch = self.last_sent_pitch
+                send_roll = self.last_sent_roll
+                v_pitch = 0.0
+                v_roll = 0.0
+                # 每100次打印一次统计
                 if self.deadzone_skip_count % 100 == 0:
-                    print(f"[死区] 已跳过 {self.deadzone_skip_count} 次发送 (变化量: P={pitch_change:.3f}° R={roll_change:.3f}°)")
-                return  # 跳过发送
-
-        # 更新上次发送的角度
-        self.last_sent_pitch = send_pitch
-        self.last_sent_roll = send_roll
+                    print(f"[死区] 保持姿态 {self.deadzone_skip_count} 次 (P={self.last_sent_pitch:.2f}° R={self.last_sent_roll:.2f}°, 变化: P={pitch_change:.3f}° R={roll_change:.3f}°)")
+            else:
+                # 不在死区，更新上次发送的角度
+                self.last_sent_pitch = send_pitch
+                self.last_sent_roll = send_roll
 
         # 发送数据到下位机
         try:
@@ -1112,7 +1118,8 @@ class AerialTrackingSystem:
                         roll_deg_raw = math.degrees(roll_raw)
                         pitch_deg_raw = math.degrees(pitch_raw)
                         
-                        # 使用一维EMA滤波器平滑角度输出（防止云台抖动）
+                        # 使用滤波器平滑角度输出（防止云台抖动）
+                        # 根据配置：卡尔曼预测滤波器或EMA滤波器
                         pitch_deg_filtered, roll_deg_filtered = self.angle_filter.update(
                             pitch_deg_raw, roll_deg_raw
                         )
@@ -1218,6 +1225,11 @@ class AerialTrackingSystem:
                 cv2.line(frame, (self.frame_center[0], self.frame_center[1]-20), 
                         (self.frame_center[0], self.frame_center[1]+20), (255, 255, 255), 2)
                 cv2.circle(frame, self.frame_center, 3, (255, 255, 255), -1)
+                
+                # 绘制死区可视化圈（绿色圆圈）
+                if self.deadzone_enabled:
+                    cv2.circle(frame, self.frame_center, int(self.deadzone_visual_radius), 
+                              (0, 255, 0), 2)
                 
                 # 计算FPS
                 current_time = time.time()
@@ -1496,6 +1508,25 @@ if __name__ == "__main__":
             max_rate_roll=MAX_RATE_ROLL,
             enable_velocity_feedforward=ENABLE_VELOCITY_FEEDFORWARD
         )
+        
+        # 从配置文件读取死区参数
+        dz_cfg = config.get('deadzone', {})
+        if 'enabled' in dz_cfg:
+            tracker.deadzone_enabled = dz_cfg['enabled']
+        if 'pitch' in dz_cfg:
+            tracker.deadzone_pitch = dz_cfg['pitch']
+        if 'roll' in dz_cfg:
+            tracker.deadzone_roll = dz_cfg['roll']
+        if 'visual_radius' in dz_cfg:
+            tracker.deadzone_visual_radius = dz_cfg['visual_radius']
+        
+        # 从配置文件读取帧间隔参数
+        fi_cfg = config.get('frame_interval', {})
+        if 'enabled' in fi_cfg:
+            tracker.interval_enabled = fi_cfg['enabled']
+        if 'interval' in fi_cfg:
+            tracker.frame_interval = fi_cfg['interval']
+        
         print("\n按键说明:")
         print("  q - 退出程序")
         print("  r - 重置跟踪状态")
