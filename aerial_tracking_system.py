@@ -162,6 +162,13 @@ class PredictiveKalmanFilter:
             return 0.0, 0.0
         return float(self.kf.statePost[2, 0]), float(self.kf.statePost[3, 0])
 
+    def zero_velocity(self):
+        """将估计角速度清零（用于目标到位时抑制速度前馈引起的抖动）"""
+        if not self.initialized:
+            return
+        self.kf.statePost[2, 0] = 0.0
+        self.kf.statePost[3, 0] = 0.0
+
     def get_prediction_time_ms(self):
         """获取当前预测时间（毫秒）"""
         return self.prediction_time * 1000.0
@@ -198,6 +205,14 @@ class GimbalPoseRecorder:
         self.pitch_deg += delta_pitch_deg
         self.roll_deg += delta_roll_deg
         self.history.append((time.time(), self.pitch_deg, self.roll_deg))
+        return self.pitch_deg, self.roll_deg
+
+    def set_pose(self, pitch_deg, roll_deg, record=True):
+        """直接设置绝对姿态（用于外部控制律输出的绝对目标角）"""
+        self.pitch_deg = float(pitch_deg)
+        self.roll_deg = float(roll_deg)
+        if record:
+            self.history.append((time.time(), self.pitch_deg, self.roll_deg))
         return self.pitch_deg, self.roll_deg
 
     def reset(self):
@@ -557,7 +572,25 @@ class AerialTrackingSystem:
         self.deadzone_enabled = True  # 死区控制开关
         self.deadzone_skip_count = 0  # 跳过发送的计数（用于统计）
         self.deadzone_visual_radius = 50  # 死区可视化半径（像素），用于画面显示
+        self.deadzone_settle_frames = 3   # 连续在死区内N帧后，执行“到位抑摆”
+        self._deadzone_streak = 0
         print(f"✓ 死区控制已启用 (pitch={self.deadzone_pitch}°, roll={self.deadzone_roll}°, 可视半径={self.deadzone_visual_radius}px)")
+
+        # 云台控制律：将“误差角”转为“绝对目标角”
+        # 目标角 = 上次发送角 + Kp * 误差角（避免把误差当增量累加导致风up/摆动）
+        self.control_gain_pitch = 1.0
+        self.control_gain_roll = 1.0
+        # D项：基于误差变化率的阻尼（刹车）
+        self.control_kd_pitch = 0.12
+        self.control_kd_roll = 0.12
+        self.control_d_alpha = 0.6  # D项低通系数(0-1)，越大越平滑
+        self._last_err_pitch = 0.0
+        self._last_err_roll = 0.0
+        self._d_pitch_filt = 0.0
+        self._d_roll_filt = 0.0
+        self._last_control_time = None
+        self.max_step_deg_pitch = 3.0  # 单次更新最大步长（度），抑制过冲
+        self.max_step_deg_roll = 3.0
         
         # 每隔N帧才进行检测和发送，预留云台调整姿态的时间
         self.frame_interval = 3       # 检测间隔（每N帧检测一次），1=每帧都检测
@@ -809,14 +842,48 @@ class AerialTrackingSystem:
         死区控制：当角度变化量小于阈值时，保持上次角度不变，速度设为0。
         """
         import math
-        # 将弧度转换为角度
-        delta_pitch_deg = math.degrees(float(pitch_delta))
-        delta_roll_deg = math.degrees(float(roll_delta))
+        # 将弧度转换为角度（这里的输入实际上是“目标相对中心的误差角”）
+        err_pitch_deg = math.degrees(float(pitch_delta))
+        err_roll_deg = math.degrees(float(roll_delta))
 
-        # 累加得到绝对角度
-        abs_pitch_deg, abs_roll_deg = self.gimbal_pose.apply_delta(delta_pitch_deg, delta_roll_deg)
-        send_pitch = round(abs_pitch_deg, 2)
-        send_roll = round(abs_roll_deg, 2)
+        # 计算 dt（用于微分项，避免帧率变化导致D项忽大忽小）
+        now_t = time.time()
+        if self._last_control_time is None:
+            dt = 1.0 / 30.0
+        else:
+            dt = max(1e-3, now_t - self._last_control_time)
+        self._last_control_time = now_t
+
+        # D项（刹车）：误差变化率。靠近中心时 err 会变小，此项多为负，起到抑制过冲作用
+        d_pitch = (err_pitch_deg - self._last_err_pitch) / dt
+        d_roll = (err_roll_deg - self._last_err_roll) / dt
+        self._last_err_pitch = err_pitch_deg
+        self._last_err_roll = err_roll_deg
+
+        # 低通滤波D项，抑制检测抖动造成的微分噪声
+        a = float(self.control_d_alpha)
+        self._d_pitch_filt = a * self._d_pitch_filt + (1.0 - a) * d_pitch
+        self._d_roll_filt = a * self._d_roll_filt + (1.0 - a) * d_roll
+
+        # 控制律：上一指令 + (Kp*误差 + Kd*误差变化率)
+        # 注意：这里的“增量”代表这次要把目标角往哪个方向推；D项提供阻尼防过冲
+        inc_pitch = (self.control_gain_pitch * err_pitch_deg) + (self.control_kd_pitch * self._d_pitch_filt)
+        inc_roll = (self.control_gain_roll * err_roll_deg) + (self.control_kd_roll * self._d_roll_filt)
+        target_pitch = self.last_sent_pitch + inc_pitch
+        target_roll = self.last_sent_roll + inc_roll
+
+        # 单次步长限制：避免目标快速变化/噪声导致过冲
+        if self.max_step_deg_pitch is not None and self.max_step_deg_pitch > 0:
+            dp = target_pitch - self.last_sent_pitch
+            dp = max(-self.max_step_deg_pitch, min(self.max_step_deg_pitch, dp))
+            target_pitch = self.last_sent_pitch + dp
+        if self.max_step_deg_roll is not None and self.max_step_deg_roll > 0:
+            dr = target_roll - self.last_sent_roll
+            dr = max(-self.max_step_deg_roll, min(self.max_step_deg_roll, dr))
+            target_roll = self.last_sent_roll + dr
+
+        send_pitch = round(float(target_pitch), 2)
+        send_roll = round(float(target_roll), 2)
         mode_str = "绝对"
 
         # 获取角速度（度/秒）
@@ -828,8 +895,8 @@ class AerialTrackingSystem:
             
             # 速度衰减机制：当角度变化很小时（接近目标中心），降低速度前馈增益
             # 避免在中心位置因速度前馈过度补偿导致来回晃动
-            pitch_change_current = abs(delta_pitch_deg)
-            roll_change_current = abs(delta_roll_deg)
+            pitch_change_current = abs(err_pitch_deg)
+            roll_change_current = abs(err_roll_deg)
             
             # 定义衰减区域：当角度偏差小于阈值时开始衰减
             decay_threshold_pitch = 2.0  # 度
@@ -847,28 +914,44 @@ class AerialTrackingSystem:
                 roll_decay_factor = roll_decay_factor ** 2
                 v_roll *= roll_decay_factor
 
-        # 死区控制：变化量小时保持上次角度不变，速度设为0
-        # 计算与上次发送角度的差值
-        pitch_change = abs(send_pitch - self.last_sent_pitch)
-        roll_change = abs(send_roll - self.last_sent_roll)
+        # 死区控制：误差角很小时保持上次角度不变，速度设为0
+        pitch_err_abs = abs(err_pitch_deg)
+        roll_err_abs = abs(err_roll_deg)
         
         in_deadzone = False
         if self.deadzone_enabled:
-            if pitch_change < self.deadzone_pitch and roll_change < self.deadzone_roll:
+            if pitch_err_abs < self.deadzone_pitch and roll_err_abs < self.deadzone_roll:
                 in_deadzone = True
                 self.deadzone_skip_count += 1
+                self._deadzone_streak += 1
                 # 保持上次的角度（保持姿态不动），速度设为0
                 send_pitch = self.last_sent_pitch
                 send_roll = self.last_sent_roll
                 v_pitch = 0.0
                 v_roll = 0.0
+                # 到位抑摆：连续在死区内若干帧后，清零滤波器速度，避免速度前馈残留导致来回摆
+                if self._deadzone_streak >= self.deadzone_settle_frames:
+                    self.angle_filter.zero_velocity()
+                    # 到位时把微分状态也“对齐”，避免下一帧D项突变
+                    self._d_pitch_filt = 0.0
+                    self._d_roll_filt = 0.0
+                    self._last_err_pitch = err_pitch_deg
+                    self._last_err_roll = err_roll_deg
                 # 每100次打印一次统计
                 if self.deadzone_skip_count % 100 == 0:
-                    print(f"[死区] 保持姿态 {self.deadzone_skip_count} 次 (P={self.last_sent_pitch:.2f}° R={self.last_sent_roll:.2f}°, 变化: P={pitch_change:.3f}° R={roll_change:.3f}°)")
+                    print(f"[死区] 保持姿态 {self.deadzone_skip_count} 次 (P={self.last_sent_pitch:.2f}° R={self.last_sent_roll:.2f}°, 误差: P={pitch_err_abs:.3f}° R={roll_err_abs:.3f}°)")
             else:
                 # 不在死区，更新上次发送的角度
                 self.last_sent_pitch = send_pitch
                 self.last_sent_roll = send_roll
+                self._deadzone_streak = 0
+        else:
+            # 未启用死区时：始终更新上次发送角度
+            self.last_sent_pitch = send_pitch
+            self.last_sent_roll = send_roll
+
+        # 同步记录云台绝对姿态（用于UI显示）
+        self.gimbal_pose.set_pose(self.last_sent_pitch, self.last_sent_roll)
 
         # 发送数据到下位机
         try:
@@ -1343,6 +1426,8 @@ if __name__ == "__main__":
             tracker.deadzone_pitch = dz_cfg['pitch']
         if 'roll' in dz_cfg:
             tracker.deadzone_roll = dz_cfg['roll']
+        if 'settle_frames' in dz_cfg:
+            tracker.deadzone_settle_frames = int(dz_cfg['settle_frames'])
         if 'visual_radius' in dz_cfg:
             tracker.deadzone_visual_radius = dz_cfg['visual_radius']
         
@@ -1352,6 +1437,25 @@ if __name__ == "__main__":
             tracker.interval_enabled = fi_cfg['enabled']
         if 'interval' in fi_cfg:
             tracker.frame_interval = fi_cfg['interval']
+
+        # 从配置文件读取云台控制律参数（可选）
+        gimbal_cfg = config.get('gimbal', {})
+        ctrl_cfg = gimbal_cfg.get('control', {}) if isinstance(gimbal_cfg, dict) else {}
+        if isinstance(ctrl_cfg, dict):
+            if 'gain_pitch' in ctrl_cfg:
+                tracker.control_gain_pitch = float(ctrl_cfg['gain_pitch'])
+            if 'gain_roll' in ctrl_cfg:
+                tracker.control_gain_roll = float(ctrl_cfg['gain_roll'])
+            if 'kd_pitch' in ctrl_cfg:
+                tracker.control_kd_pitch = float(ctrl_cfg['kd_pitch'])
+            if 'kd_roll' in ctrl_cfg:
+                tracker.control_kd_roll = float(ctrl_cfg['kd_roll'])
+            if 'd_alpha' in ctrl_cfg:
+                tracker.control_d_alpha = float(ctrl_cfg['d_alpha'])
+            if 'max_step_deg_pitch' in ctrl_cfg:
+                tracker.max_step_deg_pitch = float(ctrl_cfg['max_step_deg_pitch'])
+            if 'max_step_deg_roll' in ctrl_cfg:
+                tracker.max_step_deg_roll = float(ctrl_cfg['max_step_deg_roll'])
         
         print("\n按键说明:")
         print("  q - 退出程序")
