@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import threading
 from collections import deque
 import sys
 import os
@@ -417,6 +418,96 @@ class HikCameraCapture:
             print("相机已释放")
 
 
+class ThreadedCamera:
+    """线程化相机包装器 - 独立线程持续采集最新帧
+    
+    优点：
+    - 相机取帧不阻塞主循环
+    - 总能获取最新帧（减少延迟）
+    - FPS更稳定（避免read超时卡住）
+    - 主循环的dt仍然确定（控制精度不受影响）
+    """
+    def __init__(self, camera, enable_thread=True):
+        """
+        Args:
+            camera: HikCameraCapture 实例
+            enable_thread: 是否启用独立线程（False则退化为普通模式）
+        """
+        self.camera = camera
+        self.enable_thread = enable_thread
+        self.frame = None
+        self.ret = False
+        self.lock = threading.Lock()
+        self.stopped = False
+        self.frame_count = 0
+        
+        if self.enable_thread:
+            # 启动采集线程
+            self.thread = threading.Thread(target=self._update_loop, daemon=True)
+            self.thread.start()
+            print("✓ 相机独立线程已启动（异步采集最新帧）")
+        else:
+            print("✓ 相机运行在同步模式（主循环直接调用read）")
+    
+    def _update_loop(self):
+        """独立线程：持续采集最新帧"""
+        while not self.stopped:
+            try:
+                ret, frame = self.camera.read()
+                if ret:
+                    with self.lock:
+                        self.frame = frame
+                        self.ret = True
+                        self.frame_count += 1
+            except Exception as e:
+                print(f"⚠️ 相机线程读取异常: {e}")
+                time.sleep(0.01)
+    
+    def read(self):
+        """获取最新帧（主循环调用）"""
+        if not self.enable_thread:
+            # 同步模式：直接调用底层相机
+            return self.camera.read()
+        
+        # 异步模式：返回线程采集的最新帧
+        with self.lock:
+            if self.frame is None:
+                return False, None
+            return self.ret, self.frame.copy()
+    
+    def get_frame_count(self):
+        """获取采集帧计数（仅异步模式有效）"""
+        if not self.enable_thread:
+            return 0
+        with self.lock:
+            return self.frame_count
+    
+    def release(self):
+        """停止线程并释放相机"""
+        if self.enable_thread:
+            self.stopped = True
+            if hasattr(self, 'thread'):
+                self.thread.join(timeout=2.0)
+            print("相机采集线程已停止")
+        self.camera.release()
+    
+    def set_camera_params(self, exposure_time=None, gain=None):
+        """透传：设置相机参数"""
+        return self.camera.set_camera_params(exposure_time, gain)
+    
+    def get_camera_params(self):
+        """透传：获取相机参数"""
+        return self.camera.get_camera_params()
+    
+    @property
+    def exposure_time(self):
+        return self.camera.exposure_time
+    
+    @property
+    def gain(self):
+        return self.camera.gain
+
+
 class AerialTrackingSystem:
     """无人机激光检测模块跟踪系统
     
@@ -532,11 +623,15 @@ class AerialTrackingSystem:
         
         # 初始化海康相机
         print("初始化海康相机...")
-        self.camera = HikCameraCapture(camera_index=0, 
+        base_camera = HikCameraCapture(camera_index=0, 
                                       exposure_time=camera_exposure,
                                       gain=camera_gain)
-        if not self.camera.open():
+        if not base_camera.open():
             raise Exception("相机打开失败!")
+        
+        # 包装为线程化相机（默认启用，可通过配置禁用）
+        self.use_camera_thread = True  # 将从配置读取
+        self.camera = ThreadedCamera(base_camera, enable_thread=self.use_camera_thread)
         
         # 使用独立串口模块
         print(f"初始化串口通信...")
@@ -1272,7 +1367,30 @@ class AerialTrackingSystem:
                         print(f"  跳过发送次数: {self.deadzone_skip_count}")
                         print(f"帧间隔控制: {'启用' if self.interval_enabled else '禁用'}")
                         print(f"  检测间隔: 每{self.frame_interval}帧")
+                        print(f"控制律: PD")
+                        print(f"  Kp: pitch={self.control_gain_pitch:.2f}, roll={self.control_gain_roll:.2f}")
+                        print(f"  Kd: pitch={self.control_kd_pitch:.2f}, roll={self.control_kd_roll:.2f} (D-alpha={self.control_d_alpha:.2f})")
+                        print(f"  步长限制: pitch={self.max_step_deg_pitch:.2f}°, roll={self.max_step_deg_roll:.2f}°")
+                        print(f"相机线程: {'启用' if self.use_camera_thread else '禁用'}")
+                        if self.use_camera_thread:
+                            frame_cnt = self.camera.get_frame_count()
+                            print(f"  线程采集帧数: {frame_cnt}")
                         print("==================")
+                elif key == ord('t'):
+                    # 切换相机线程模式
+                    self.use_camera_thread = not self.use_camera_thread
+                    self.camera.enable_thread = self.use_camera_thread
+                    if self.use_camera_thread:
+                        # 重启线程
+                        if not self.camera.thread.is_alive():
+                            self.camera.stopped = False
+                            self.camera.thread = threading.Thread(target=self.camera._update_loop, daemon=True)
+                            self.camera.thread.start()
+                        print("✓ 相机独立线程已启用")
+                    else:
+                        # 停止线程
+                        self.camera.stopped = True
+                        print("✓ 相机独立线程已禁用（切换到同步模式）")
                 elif key == ord('z'):
                     # 减小死区阈值
                     self.deadzone_pitch = max(0.02, self.deadzone_pitch - 0.02)
@@ -1347,6 +1465,7 @@ if __name__ == "__main__":
     camera_cfg = config.get('camera', {})
     CAMERA_EXPOSURE = camera_cfg.get('exposure_time', 55915.0)
     CAMERA_GAIN = camera_cfg.get('gain', 10.5)
+    USE_CAMERA_THREAD = camera_cfg.get('use_thread', True)
 
     # ========== 相机标定参数 ==========
     calib_cfg = config.get('calibration', {})
@@ -1437,6 +1556,15 @@ if __name__ == "__main__":
             tracker.interval_enabled = fi_cfg['enabled']
         if 'interval' in fi_cfg:
             tracker.frame_interval = fi_cfg['interval']
+        
+        # 应用相机线程设置
+        tracker.use_camera_thread = USE_CAMERA_THREAD
+        tracker.camera.enable_thread = USE_CAMERA_THREAD
+        if USE_CAMERA_THREAD and not tracker.camera.thread.is_alive():
+            # 如果线程未启动，重新启动
+            tracker.camera.thread = threading.Thread(target=tracker.camera._update_loop, daemon=True)
+            tracker.camera.thread.start()
+            print("✓ 相机独立线程已重启")
 
         # 从配置文件读取云台控制律参数（可选）
         gimbal_cfg = config.get('gimbal', {})
@@ -1466,6 +1594,7 @@ if __name__ == "__main__":
         print("  z/x - 减小/增大死区阈值")
         print("  m - 重置云台姿态记录（重新以当前为初始）")
         print("  p - 显示当前系统参数")
+        print("  t - 切换相机线程模式（异步/同步）")
         print("  i - 切换帧间隔控制")
         print("  ,/. - 减小/增大帧间隔")
         print("  +/- - 增加/减少曝光时间")

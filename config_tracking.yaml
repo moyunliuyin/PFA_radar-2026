@@ -18,6 +18,7 @@ gpu:
 camera:
   exposure_time: 55915.0        # 曝光时间（微秒）35000 = 35ms
   gain: 10                      # 增益（dB），范围 0-24
+  use_thread: true              # 独立线程采集（减少read阻塞，提高FPS稳定性）
   
 # 相机标定参数
 calibration:
