@@ -77,8 +77,24 @@ key_modifiable = -1  # 密钥是否可修改
 chances_flag = 1  # 双倍易伤触发标志位，需要从1递增，每小局比赛会重置，所以每局比赛要重启程序
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
 
-# 距离触发双倍易伤相关
-distance_check_buffer = deque(maxlen=2)  # 存储最近2帧的距离判断结果
+# 双倍易伤触发策略配置
+trigger_mode = config['double_vulnerability']['trigger_mode']  # 'distance', 'motion', 'both'
+print(f"双倍易伤触发模式: {trigger_mode}")
+
+# 距离触发相关
+if trigger_mode in ['distance', 'both']:
+    distance_check_buffer = deque(maxlen=2)  # 存储最近2帧的距离判断结果
+    distance_threshold = config['double_vulnerability']['distance']['threshold']
+
+# 运动趋势触发相关
+if trigger_mode in ['motion', 'both']:
+    motion_check_buffer = deque(maxlen=2)  # 存储最近2帧的运动趋势判断结果
+    # 记录每个机器人的位置历史（time, (x, y)）
+    robot_position_history = {}
+    for robot in ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']:
+        robot_position_history[robot] = deque(maxlen=5)  # 保存最近5帧的位置和时间戳
+    # 读取运动趋势相关参数
+    motion_params = config['double_vulnerability']['motion']
 
 # 加载战场地图
 map = map_backup.copy()
@@ -622,7 +638,7 @@ def ser_send():
 
     # 定义距离触发检查函数
     def check_distance_trigger():
-        """检查己方有输出的机器人与任意敌方机器人的距离是否满足触发条件"""
+        """【策略1】检查己方有输出的机器人与任意敌方机器人的距离是否满足触发条件"""
         # 己方有输出的机器人：英雄 + 步兵 + 哨兵
         our_output_robots = ['R1', 'R2', 'R3', 'R4', 'R5', 'R7'] if state == 'R' else ['B1', 'B2', 'B3', 'B4', 'B5', 'B7']
         # 敌方所有机器人
@@ -634,7 +650,6 @@ def ser_send():
             if send_map[our_robot] == (0, 0):
                 continue
             # 排除正在使用盲区预测点的机器人
-            # 注意：哨兵在盲区时，send_map会存储预测点坐标（非真实位置），必须排除
             if guess_list.get(our_robot, True):
                 continue
             
@@ -643,7 +658,7 @@ def ser_send():
                 # 排除完全未检测到的敌方机器人
                 if send_map[enemy] == (0, 0):
                     continue
-                # 排除正在使用盲区预测点的敌方机器人（预测点不准确，不能用于距离判断）
+                # 排除正在使用盲区预测点的敌方机器人
                 if guess_list.get(enemy, True):
                     continue
                 
@@ -652,9 +667,150 @@ def ser_send():
                 dy = (send_map[our_robot][1] - send_map[enemy][1]) / 100.0
                 distance = np.sqrt(dx**2 + dy**2)
                 
-                # 距离阈值：2.5米（考虑延迟补偿）
-                if distance < 2.5:
-                    print(f"距离满足条件: {our_robot} vs {enemy}, 距离={distance:.2f}米")
+                # 使用配置的距离阈值
+                if distance < distance_threshold:
+                    print(f"[距离触发] {our_robot} vs {enemy}, 距离={distance:.2f}米")
+                    return True
+        
+        return False
+    
+    def calculate_velocity(position_history):
+        """计算机器人的平均速度向量（单位：米/秒）
+        
+        Args:
+            position_history: deque of (time, (x, y))
+        
+        Returns:
+            (vx, vy) 或 None（如果数据不足）
+        """
+        if len(position_history) < 2:
+            return None
+        
+        # 使用最近2帧计算瞬时速度
+        t1, (x1, y1) = position_history[-2]
+        t2, (x2, y2) = position_history[-1]
+        
+        dt = t2 - t1
+        if dt < 0.01:  # 时间间隔太小，避免除零
+            return None
+        
+        # 计算速度（坐标单位是cm，转换为m/s）
+        vx = (x2 - x1) / 100.0 / dt
+        vy = (y2 - y1) / 100.0 / dt
+        
+        return (vx, vy)
+    
+    def is_approaching(our_pos, enemy_pos, our_vel, enemy_vel):
+        """判断两个机器人是否有相互接近的趋势
+        
+        Args:
+            our_pos: (x, y) 己方位置（cm）
+            enemy_pos: (x, y) 敌方位置（cm）
+            our_vel: (vx, vy) 己方速度（m/s）
+            enemy_vel: (vx, vy) 敌方速度（m/s）
+        
+        Returns:
+            bool: 是否满足触发条件
+        """
+        # 计算当前距离（米）
+        dx = (enemy_pos[0] - our_pos[0]) / 100.0
+        dy = (enemy_pos[1] - our_pos[1]) / 100.0
+        distance = np.sqrt(dx**2 + dy**2)
+        
+        # 使用配置的距离参数
+        close_dist = motion_params['close_distance']
+        far_dist = motion_params['far_distance']
+        approach_spd = motion_params['approach_speed']
+        active_spd = motion_params['active_speed']
+        min_spd = motion_params['min_speed']
+        
+        # 如果距离已经很近，直接触发
+        if distance < close_dist:
+            return True
+        
+        # 如果距离太远，不触发
+        if distance > far_dist:
+            return False
+        
+        # 中距离情况，检查运动趋势
+        # 计算位置向量（从己方指向敌方）
+        if distance < 0.01:
+            return False
+        
+        direction_x = dx / distance
+        direction_y = dy / distance
+        
+        # 计算相对速度（敌方相对于己方的速度）
+        rel_vx = enemy_vel[0] - our_vel[0]
+        rel_vy = enemy_vel[1] - our_vel[1]
+        rel_speed = np.sqrt(rel_vx**2 + rel_vy**2)
+        
+        if rel_speed < 0.1:  # 相对速度太小，认为没有明显运动趋势
+            return False
+        
+        # 计算相对速度在位置向量上的投影（负值表示正在接近）
+        approach_velocity = -(rel_vx * direction_x + rel_vy * direction_y)
+        
+        # 如果接近速度超过阈值，认为有交战趋势
+        if approach_velocity > approach_spd:
+            print(f"接近速度={approach_velocity:.2f}m/s, 距离={distance:.2f}m")
+            return True
+        
+        # 也检查己方是否主动向敌方移动
+        our_speed = np.sqrt(our_vel[0]**2 + our_vel[1]**2)
+        if our_speed > min_spd:  # 己方在移动
+            # 己方速度在敌方方向上的投影
+            our_approach = our_vel[0] * direction_x + our_vel[1] * direction_y
+            if our_approach > active_spd:  # 己方正在快速接近敌方
+                print(f"己方接近速度={our_approach:.2f}m/s, 距离={distance:.2f}m")
+                return True
+        
+        return False
+    
+    def check_motion_trend_trigger():
+        """【策略2】检测双方机器人运动趋势，判断是否有交战趋势"""
+        # 己方有输出的机器人：英雄 + 步兵 + 哨兵
+        our_output_robots = ['R1', 'R2', 'R3', 'R4', 'R5', 'R7'] if state == 'R' else ['B1', 'B2', 'B3', 'B4', 'B5', 'B7']
+        # 敌方所有机器人
+        enemy_robots = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7'] if state == 'R' else ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7']
+        
+        # 遍历己方所有输出机器人
+        for our_robot in our_output_robots:
+            # 需要至少2帧数据才能计算速度
+            if len(robot_position_history[our_robot]) < 2:
+                continue
+            # 排除正在使用盲区预测点的机器人
+            if guess_list.get(our_robot, True):
+                continue
+            
+            # 计算己方机器人的速度向量
+            our_vel = calculate_velocity(robot_position_history[our_robot])
+            if our_vel is None:
+                continue
+            
+            # 获取己方当前位置
+            our_pos = robot_position_history[our_robot][-1][1]  # (time, (x, y))
+            
+            # 遍历所有敌方机器人
+            for enemy in enemy_robots:
+                # 需要至少2帧数据才能计算速度
+                if len(robot_position_history[enemy]) < 2:
+                    continue
+                # 排除正在使用盲区预测点的敌方机器人
+                if guess_list.get(enemy, True):
+                    continue
+                
+                # 计算敌方机器人的速度向量
+                enemy_vel = calculate_velocity(robot_position_history[enemy])
+                if enemy_vel is None:
+                    continue
+                
+                # 获取敌方当前位置
+                enemy_pos = robot_position_history[enemy][-1][1]
+                
+                # 判断是否有接近趋势
+                if is_approaching(our_pos, enemy_pos, our_vel, enemy_vel):
+                    print(f"运动趋势满足条件: {our_robot} vs {enemy}")
                     return True
         
         return False
@@ -807,30 +963,58 @@ def ser_send():
 
                         time_s = time.time()
             
-            # 基于距离的双倍易伤触发判断
-            distance_trigger_now = check_distance_trigger()
-            distance_check_buffer.append(distance_trigger_now)
+            # ====== 双倍易伤自动触发逻辑 ======
+            trigger_now = False
+            trigger_method = ""
             
-            # 连续2帧都满足距离条件才触发（防止检测抖动）
-            if len(distance_check_buffer) >= 2 and all(distance_check_buffer):
+            # 策略1：基于距离的触发
+            if trigger_mode in ['distance', 'both']:
+                distance_trigger_now = check_distance_trigger()
+                distance_check_buffer.append(distance_trigger_now)
+                # 连续2帧都满足距离条件才触发（防止检测抖动）
+                if len(distance_check_buffer) >= 2 and all(distance_check_buffer):
+                    trigger_now = True
+                    trigger_method = "距离触发"
+                    distance_check_buffer.clear()  # 触发后清空，避免连续触发
+            
+            # 策略2：基于运动趋势的触发
+            if trigger_mode in ['motion', 'both']:
+                # 更新机器人位置历史（用于运动趋势分析）
+                current_time = time.time()
+                for robot_id in send_map:
+                    pos = send_map[robot_id]
+                    # 只记录真实检测到的位置（排除(0,0)和盲区预测点）
+                    if pos != (0, 0) and not guess_list.get(robot_id, True):
+                        robot_position_history[robot_id].append((current_time, pos))
+                
+                # 基于运动趋势的双倍易伤触发判断
+                motion_trigger_now = check_motion_trend_trigger()
+                motion_check_buffer.append(motion_trigger_now)
+                
+                # 连续2帧都满足运动趋势条件才触发（防止检测抖动）
+                if len(motion_check_buffer) >= 2 and all(motion_check_buffer):
+                    trigger_now = True
+                    trigger_method = "运动趋势触发" if trigger_method == "" else "距离+运动趋势触发"
+                    motion_check_buffer.clear()  # 触发后清空，避免连续触发
+            
+            # 执行双倍易伤触发
+            if trigger_now:
                 # 有双倍易伤机会，并且当前没有在双倍易伤
                 if double_vulnerability_chance > 0 and opponent_double_vulnerability == 0:
                     time_e = time.time()
                     # 共享10秒防抖
                     if time_e - time_s > 10:
-                        print("距离触发：请求双倍易伤")
+                        print(f"[{trigger_method}] 请求双倍易伤")
                         data = build_data_decision(chances_flag, state)
                         packet, seq = build_send_packet(data, seq, [0x03, 0x01])
                         ser1.write(packet)
-                        print("距离触发成功", chances_flag)
+                        print(f"[{trigger_method}] 请求成功", chances_flag)
                         # 更新标志位
                         chances_flag += 1
                         if chances_flag >= 3:
                             chances_flag = 1
                         
                         time_s = time.time()
-                        # 触发后清空缓冲区，避免连续触发
-                        distance_check_buffer.clear()
         except Exception as r:
             print('未知错误 %s' % (r))
 

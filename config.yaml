@@ -59,6 +59,17 @@ blind_zone:
     B2: [[1906, 748], [2559, 1398]] # [1460, 688]
     B7: [[2126, 755], [2400, 671]]
 
+double_vulnerability:
+  trigger_mode: 'both'  # 触发策略: 'distance'(仅距离), 'motion'(仅运动趋势), 'both'(两种都启用)
+  distance:
+    threshold: 2.5  # 距离阈值(米)
+  motion:
+    close_distance: 3.0  # 近距离阈值(米)，小于此距离直接触发
+    far_distance: 6.0  # 远距离阈值(米)，大于此距离不触发
+    approach_speed: 0.5  # 接近速度阈值(m/s)，双方相对接近速度
+    active_speed: 0.5  # 主动移动速度阈值(m/s)，己方向敌方移动的速度
+    min_speed: 0.3  # 最小移动速度(m/s)，低于此速度认为无明显运动
+
 ui:
   info_panel_size: [420, 500]  # 信息面板尺寸
   map_display_size: [900, 480]  # 地图显示尺寸
