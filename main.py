@@ -7,6 +7,8 @@ import datetime
 import threading
 import time
 import struct
+import random
+import string
 from collections import deque
 import serial
 from information_ui import draw_information_ui
@@ -17,7 +19,7 @@ import cv2
 import numpy as np
 from detect_function import YOLOv5Detector
 from RM_serial_py.ser_api import build_send_packet, receive_packet, Radar_decision, \
-    build_data_decision, build_data_radar_all
+    build_data_decision, build_data_radar_all, generate_random_password
 import yaml
 
 with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
@@ -73,9 +75,15 @@ information_ui_show = information_ui.copy()
 double_vulnerability_chance = -1  # 双倍易伤机会数
 opponent_double_vulnerability = -1  # 是否正在触发双倍易伤
 target = -1  # 飞镖当前瞄准目标（用于触发双倍易伤）
+encryption_level = 1  # 己方加密等级（对方干扰波难度），开局为1，最高为3，来源于0x020E指令bit3-4
 key_modifiable = -1  # 密钥是否可修改
-chances_flag = 1  # 双倍易伤触发标志位，需要从1递增，每小局比赛会重置，所以每局比赛要重启程序
+chances_flag = 0  # radar_cmd当前值，开局为0，每小局重置需重启程序，触发后循环递0→1→2→0→...
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
+
+# 密钥相关全局变量
+current_password = generate_random_password()  # 开局生成随机密钥
+password_sent = False  # 开局密钥是否已发送
+last_encryption_level = 1  # 上一次的加密等级，用于检测等级变化（开局为1）
 
 # 双倍易伤触发策略配置
 trigger_mode = config['double_vulnerability']['trigger_mode']  # 'distance', 'motion', 'both'
@@ -555,6 +563,10 @@ def ser_send():
     seq = 0
     global chances_flag
     global guess_value
+    global encryption_level
+    global current_password
+    global password_sent
+    global last_encryption_level
     # 单点预测时间
     guess_time = {
         'B1': 0,
@@ -835,12 +847,42 @@ def ser_send():
         "B6": (0, 0),
         "B7": (0, 0)
     }
+    # ====== 开局发送初始密钥 ======
+    key_update_time = 0  # 密钥更新发送时间戳
     while True:
 
         guess_time_limit = config['blind_zone']['base_time'] + config['blind_zone'][
             'offset_time']  # 单位：秒，根据上一帧的信道占用数动态调整单点预测时间
         # print(guess_time_limit)
         send_count = 0  # 重置信道占用数
+
+        # ====== 0x0121 雷达自主决策：双倍易伤 + 密钥更新 整合发送 ======
+        # 每帧先分别判断各自触发条件，最后合并成一个数据包发送
+        need_send_decision = False       # 本帧是否需要发送0x0121
+        decision_radar_cmd = chances_flag  # radar_cmd: 默认为当前值（不触发双倍易伤时保持不变）
+        decision_password_cmd = 0        # password_cmd: 0=无密钥操作, 1=更新己方密钥
+        decision_password = [0] * 6      # 密钥值：默认全0，仅password_cmd=1时填充实际密钥
+
+        # --- 密钥更新判断 ---
+        # 开局发送初始密钥（仅一次）
+        if not password_sent:
+            if key_modifiable == 1 or key_modifiable == -1:
+                print(f"开局发送初始密钥: {[chr(c) for c in current_password]}")
+                decision_password_cmd = 1
+                decision_password = current_password
+                need_send_decision = True
+                password_sent = True
+
+        # 检测加密等级变化（对方破解成功导致等级提高），更新密钥
+        if encryption_level > last_encryption_level:
+            if key_modifiable == 1:
+                current_password = generate_random_password()
+                print(f"加密等级提升({last_encryption_level}->{encryption_level})，更新密钥: {[chr(c) for c in current_password]}")
+                decision_password_cmd = 1
+                decision_password = current_password
+                need_send_decision = True
+        last_encryption_level = encryption_level
+
         try:
             all_filter_data = filter.get_all_data()
             if state == 'R':
@@ -942,7 +984,7 @@ def ser_send():
                     guess_value['R2'] = guess_value_now.get('R2')
                     guess_value['R7'] = guess_value_now.get('R7')
 
-            # 判断飞镖的目标是否切换，切换则尝试发动双倍易伤
+            # --- 双倍易伤判断：飞镖目标切换触发 ---
             if target != target_last and target != 0:
                 target_last = target
                 # 有双倍易伤机会，并且当前没有在双倍易伤
@@ -951,19 +993,14 @@ def ser_send():
                     # 发送时间间隔为10秒
                     if time_e - time_s > 10:
                         print("飞镖触发：请求双倍易伤")
-                        data = build_data_decision(chances_flag, state)
-                        packet, seq = build_send_packet(data, seq, [0x03, 0x01])
-                        # print(packet.hex(),chances_flag,state)
-                        ser1.write(packet)
-                        print("请求成功", chances_flag)
-                        # 更新标志位
                         chances_flag += 1
-                        if chances_flag >= 3:
-                            chances_flag = 1
-
+                        if chances_flag > 2:
+                            chances_flag = 0
+                        decision_radar_cmd = chances_flag  # radar_cmd设为递增后的新值
+                        need_send_decision = True
                         time_s = time.time()
             
-            # ====== 双倍易伤自动触发逻辑 ======
+            # --- 双倍易伤判断：自动触发逻辑 ---
             trigger_now = False
             trigger_method = ""
             
@@ -997,24 +1034,36 @@ def ser_send():
                     trigger_method = "运动趋势触发" if trigger_method == "" else "距离+运动趋势触发"
                     motion_check_buffer.clear()  # 触发后清空，避免连续触发
             
-            # 执行双倍易伤触发
+            # 执行双倍易伤自动触发（仅设置标志，不单独发包）
             if trigger_now:
                 # 有双倍易伤机会，并且当前没有在双倍易伤
                 if double_vulnerability_chance > 0 and opponent_double_vulnerability == 0:
                     time_e = time.time()
                     # 共享10秒防抖
                     if time_e - time_s > 10:
-                        print(f"[{trigger_method}] 请求双倍易伤")
-                        data = build_data_decision(chances_flag, state)
-                        packet, seq = build_send_packet(data, seq, [0x03, 0x01])
-                        ser1.write(packet)
-                        print(f"[{trigger_method}] 请求成功", chances_flag)
-                        # 更新标志位
-                        chances_flag += 1
-                        if chances_flag >= 3:
-                            chances_flag = 1
-                        
-                        time_s = time.time()
+                        # 如果飞镖触发已经设置了radar_cmd，则不重复设置
+                        if decision_radar_cmd == chances_flag:
+                            print(f"[{trigger_method}] 请求双倍易伤")
+                            chances_flag += 1
+                            if chances_flag > 2:
+                                chances_flag = 0
+                            decision_radar_cmd = chances_flag  # radar_cmd设为递增后的新值
+                            need_send_decision = True
+                            time_s = time.time()
+
+            # ====== 统一发送 0x0121 数据包 ======
+            if need_send_decision:
+                data = build_data_decision(decision_radar_cmd, state,
+                                           password_cmd=decision_password_cmd,
+                                           password=decision_password)
+                packet, seq = build_send_packet(data, seq, [0x03, 0x01])
+                ser1.write(packet)
+                parts = []
+                if decision_radar_cmd > 0:
+                    parts.append(f"双倍易伤(radar_cmd={decision_radar_cmd})")
+                if decision_password_cmd == 1:
+                    parts.append(f"密钥更新({[chr(c) for c in decision_password]})")
+                print(f"[0x0121] 已发送: {' + '.join(parts)}")
         except Exception as r:
             print('未知错误 %s' % (r))
 
@@ -1027,6 +1076,7 @@ def ser_receive():
     global vulnerability  # 标记进度列表
     global double_vulnerability_chance  # 拥有双倍易伤次数
     global opponent_double_vulnerability  # 双倍易伤触发状态
+    global encryption_level  # 己方加密等级
     global key_modifiable  # 密钥是否可修改
     global target  # 飞镖当前目标
     progress_cmd_id = [0x02, 0x0C]  # 任意想要接收数据的命令码，这里是雷达标记进度的命令码0x020C
@@ -1061,26 +1111,26 @@ def ser_receive():
 
                 # 解析数据包
                 progress_result = receive_packet(packet_data, progress_cmd_id,
-                                                 info=False)  # 解析单个数据包，cmd_id为0x020E,不输出日志
+                                                 info=False)  # 解析单个数据包，cmd_id为0x020C
                 vulnerability_result = receive_packet(packet_data, vulnerability_cmd_id, info=False)
                 target_result = receive_packet(packet_data, target_cmd_id, info=False)
                 # 更新裁判系统数据，标记进度、易伤、飞镖目标
                 if progress_result is not None:
                     received_cmd_id1, received_data1, received_seq1 = progress_result
                     mark_progress = struct.unpack('H', received_data1[:2])[0]
-                    vulnerability = [((mark_progress >> i) & 0x01) * 120 for i in range(5)]
+                    vulnerability = [((mark_progress >> i) & 0x01) * 120 for i in range(6)]
                     if state == 'R':
                         guess_value_now['B1'] = vulnerability[0]
                         guess_value_now['B2'] = vulnerability[1]
-                        guess_value_now['B7'] = vulnerability[4]
+                        guess_value_now['B7'] = vulnerability[5]
                     else:
                         guess_value_now['R1'] = vulnerability[0]
                         guess_value_now['R2'] = vulnerability[1]
-                        guess_value_now['R7'] = vulnerability[4]
+                        guess_value_now['R7'] = vulnerability[5]
                 if vulnerability_result is not None:
                     received_cmd_id2, received_data2, received_seq2 = vulnerability_result
                     received_data2 = list(received_data2)[0]
-                    double_vulnerability_chance, opponent_double_vulnerability, key_modifiable = Radar_decision(received_data2)
+                    double_vulnerability_chance, opponent_double_vulnerability, encryption_level, key_modifiable = Radar_decision(received_data2)
                 if target_result is not None:
                     received_cmd_id3, received_data3, received_seq3 = target_result
                     target = (list(received_data3)[1] & 0b1100000) >> 5

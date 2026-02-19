@@ -1,4 +1,6 @@
 import struct
+import random
+import string
 
 # CRC8校验表
 
@@ -147,17 +149,39 @@ def build_data_radar_all(send_map,state):
 
 
 
-def build_data_decision(chances,state):
+def generate_random_password():
+    """生成6位随机密钥，每位为ASCII编码的字母或数字"""
+    chars = string.ascii_letters + string.digits  # a-z A-Z 0-9
+    password = [ord(random.choice(chars)) for _ in range(6)]
+    return password
+
+
+def build_data_decision(radar_cmd, state, password_cmd=0, password=None):
+    """
+    构建0x0121雷达自主决策数据包（radar_cmd_t 共8字节）
+    :param radar_cmd: uint8_t 雷达是否确认触发双倍易伤标志 (即原 chances_flag)
+    :param state: 'R' 红方 / 'B' 蓝方
+    :param password_cmd: uint8_t 密钥指令类型 (0=无操作, 1=更新己方密钥, 2=验证对方密钥)
+    :param password: list[6] 密钥值，6个ASCII码整数，为None时填充0
+    """
+    if password is None:
+        password = [0] * 6
     data = bytearray()
+    # 交互内容ID: 0x0121 (小端序)
     cmd_id = [0x01, 0x21]
     cmd_id = bytearray([cmd_id[1], cmd_id[0]])
     data.extend(cmd_id)
+    # 接收方机器人ID
     if state == 'R':
         data.extend(bytearray(struct.pack('H', 9)))
     else:
         data.extend(bytearray(struct.pack('H', 109)))
-    data.extend(bytearray([0x80,0x80]))
-    data.extend(bytearray(struct.pack('B', chances)))
+    data.extend(bytearray([0x80, 0x80]))
+    # radar_cmd_t 数据段 (8字节)
+    data.extend(bytearray(struct.pack('B', radar_cmd)))      # byte0: radar_cmd
+    data.extend(bytearray(struct.pack('B', password_cmd)))    # byte1: password_cmd
+    for i in range(6):                                        # byte2-7: password_1~6
+        data.extend(bytearray(struct.pack('B', password[i])))
     return data
 
 
@@ -257,14 +281,17 @@ def Radar_decision(byte_data):
     # 提取第 2 位的对方双倍易伤状态
     opponent_double_vulnerability = (byte_data & 0b00000100) >> 2
 
+    # 提取第 3-4 位的己方加密等级（对方干扰波难度），开局为1，最高为3
+    encryption_level = (byte_data & 0b00011000) >> 3
+
     # 提取第 5 位的密钥修改标志
     key_modifiable = (byte_data & 0b00100000) >> 5
 
-    # 提取第 3-4, 6-7 位（保留位，不使用）
-    # reserved_bits = (byte_data & 0b11011000) >> 3
+    # 提取第 6-7 位（保留位，不使用）
+    # reserved_bits = (byte_data & 0b11000000) >> 6
 
     # 打印结果
     # print(f"双倍易伤机会: {double_vulnerability_chance}")
     # print(f"对方正在被触发双倍易伤: {opponent_double_vulnerability}")
     # print(f"密钥是否可修改: {key_modifiable}")
-    return double_vulnerability_chance, opponent_double_vulnerability, key_modifiable
+    return double_vulnerability_chance, opponent_double_vulnerability, encryption_level, key_modifiable
