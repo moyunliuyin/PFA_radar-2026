@@ -159,10 +159,8 @@ class MyUI(QWidget):
         self.left_top_label.setFixedSize(1350, 1000)
         self.left_top_label.setStyleSheet("border: 2px solid black;")
         self.left_top_label.mousePressEvent = self.left_top_clicked
-        self.image_points = [[(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)],
-                             [(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)]]
-        self.map_points = [[(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)],
-                           [(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)]]
+        self.image_points = [[(0, 0), (0, 0), (0, 0), (0, 0)]]
+        self.map_points = [[(0, 0), (0, 0), (0, 0), (0, 0)]]
         self.image_count = 0
         self.map_count = 0
         # 右上角部分
@@ -182,6 +180,7 @@ class MyUI(QWidget):
 
         self.button2 = QPushButton('切换高度', self)
         self.button2.setFixedSize(100, 30)
+        self.button2.setEnabled(False)  # 单层地图无需切换高度
         self.button2.clicked.connect(self.button2_clicked)
 
         self.button3 = QPushButton('加载坐标', self)
@@ -319,12 +318,9 @@ class MyUI(QWidget):
         print('开始标定')
 
     def button2_clicked(self):
-        # 按钮2点击事件
-        self.append_text('切换高度')
-        self.image_count = 0
-        self.map_count = 0
-        self.height = (self.height + 1) % 2
-        print('切换高度')
+        # 单层地图，无需切换高度
+        self.append_text('单层地图无需切换高度')
+        print('单层地图无需切换高度')
 
     def button3_clicked(self):
         # 按钮3点击事件
@@ -333,13 +329,12 @@ class MyUI(QWidget):
         print('加载坐标')
 
     def button4_clicked(self):
-        # 按钮4点击事件
+        # 按钮4点击事件（保存计算）
         print(self.image_points)
         print(self.map_points)
-        for i in range(0, 2):
-            image_point = np.array(self.image_points[i], dtype=np.float32)
-            map_point = np.array(self.map_points[i], dtype=np.float32)
-            self.T.append(cv2.getPerspectiveTransform(image_point, map_point))
+        image_point = np.array(self.image_points[0], dtype=np.float32)
+        map_point = np.array(self.map_points[0], dtype=np.float32)
+        self.T = [cv2.getPerspectiveTransform(image_point, map_point)]
 
         np.save(self.save_path, self.T)
 

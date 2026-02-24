@@ -49,6 +49,7 @@ kalman:
   measurement_noise: 1e-1
 
 blind_zone:
+  enabled: false  # 盲区预测开关（单层地图建议关闭）
   base_time: 3.0  # 基础预测时间
   offset_time: 1.7  # 时间偏移量(根据上一帧的信道占用数动态调整单点预测时间)
   points:

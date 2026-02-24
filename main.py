@@ -56,15 +56,13 @@ else:
     loaded_arrays = np.load(config['paths']['calibration']['blue'])
     map_image = cv2.imread(config['paths']['map_images']['blue'])
 
-mask_image = cv2.imread(config['paths']['map_images']['mask'])
 map_backup = cv2.imread(config['paths']['map_images']['backup'])
 
-# 导入战场每个高度的不同仿射变化矩阵
-M_ground = loaded_arrays[0]  # 地面层、公路层
-M_height_r = loaded_arrays[1]  # 中央高地
+# 导入仿射变换矩阵（单层）
+M_ground = loaded_arrays[0]  # 地面层
 
 # 确定地图画面像素，保证不会溢出
-height, width = mask_image.shape[:2]
+height, width = map_backup.shape[:2]
 height -= 1
 width -= 1
 
@@ -161,10 +159,14 @@ mapping_table = {
     "B7": 107
 }
 
+# 盲区预测开关
+blind_zone_enabled = config['blind_zone'].get('enabled', True)
+
 # 盲区预测点位
 guess_table = {}
-for robot, points in config['blind_zone']['points'].items():
-    guess_table[robot] = [tuple(point) for point in points]
+if blind_zone_enabled:
+    for robot, points in config['blind_zone']['points'].items():
+        guess_table[robot] = [tuple(point) for point in points]
 
 
 class KalmanFilter:
@@ -919,9 +921,8 @@ def ser_send():
                     send_map['B5'] = (0, 0)
 
                 # 哨兵
-                if guess_list.get('B7'):
+                if blind_zone_enabled and guess_list.get('B7'):
                     send_map['B7'] = send_point_guess('B7', guess_time_limit)
-                # 未识别到哨兵，进行盲区预测
                 else:
                     if all_filter_data.get('B7', False):
                         send_map['B7'] = send_point_B('B7', all_filter_data)
@@ -960,9 +961,8 @@ def ser_send():
                     send_map['R5'] = (0, 0)
 
                 # 哨兵
-                if guess_list.get('R7'):
+                if blind_zone_enabled and guess_list.get('R7'):
                     send_map['R7'] = send_point_guess('R7', guess_time_limit)
-                # 未识别到哨兵，进行盲区预测
                 else:
                     if all_filter_data.get('R7', False):
                         send_map['R7'] = send_point_R('R7', all_filter_data)
@@ -1327,28 +1327,12 @@ while True:
                     # 原图中装甲板的中心下沿作为待仿射变化的点
                     t1 = time.time()
                     camera_point = np.array([[[min(x0 + 0.5 * w, img_x), min(y0 + 1.5 * h, img_y)]]], dtype=np.float32)
-                    # 先套用地面层仿射变化矩阵
+                    # 套用仿射变换矩阵（单层）
                     mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-                    x_c = max(int(mapped_point[0][0][0]), 0)
-                    y_c = max(int(mapped_point[0][0][1]), 0)
-                    x_c = min(x_c, width)
-                    y_c = min(y_c, height)
-                    color = mask_image[y_c, x_c]  # 通过掩码图像，获取地面层的颜色：黑（0，0，0）
-                    if color[0] == color[1] == color[2] == 0:
-                        X_M = x_c
-                        Y_M = y_c
-                        # Z_M = 0
-                    else:
-                        # 不满足则继续套用R型高地层仿射变换矩阵
-                        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_height_r)
-                        x_c = max(int(mapped_point[0][0][0]), 0)
-                        y_c = max(int(mapped_point[0][0][1]), 0)
-                        x_c = min(x_c, width)
-                        y_c = min(y_c, height)
-                        color = mask_image[y_c, x_c]  # 通过掩码图像，获取R型高地层的颜色：绿（0，255，0）
-                        X_M = x_c
-                        Y_M = y_c
-                        # Z_M = 400
+                    X_M = max(int(mapped_point[0][0][0]), 0)
+                    Y_M = max(int(mapped_point[0][0][1]), 0)
+                    X_M = min(X_M, width)
+                    Y_M = min(Y_M, height)
                     if isinstance(filter, SlidingWindowFilter):
                         # 滑动窗口需要完整坐标序列
                         filter.add_data(best_cls, X_M, Y_M)
