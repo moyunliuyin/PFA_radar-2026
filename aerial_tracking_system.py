@@ -445,6 +445,17 @@ class ThreadedCamera:
             # 启动采集线程
             self.thread = threading.Thread(target=self._update_loop, daemon=True)
             self.thread.start()
+            # 等待第一帧就绪（最多5秒）
+            print("⏳ 等待相机采集第一帧...", end='', flush=True)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                with self.lock:
+                    if self.frame is not None:
+                        break
+                time.sleep(0.05)
+            else:
+                print(" 超时! 请检查相机连接")
+            print(" OK")
             print("✓ 相机独立线程已启动（异步采集最新帧）")
         else:
             print("✓ 相机运行在同步模式（主循环直接调用read）")
@@ -521,9 +532,10 @@ class AerialTrackingSystem:
     角度模式：累积计算绝对偏转角度发送至下位机
     应用场景：地面站云台跟踪空中无人机的激光检测模块
     
-    当前测试：使用 yolov5s.pt + apple class 临时测试直接检测功能
+    当前使用：best.pt 训练权重 + data2_laser.yaml（单类 laser 检测）
     """
     def __init__(self, aerial_model_path=None, laser_module_model_path=None,
+                 laser_data_yaml='data2_laser.yaml',
                  serial_port='COM8', baudrate=115200, use_gpu=True,
                  camera_fx=15989.09, camera_fy=15985.61,
                  camera_cx=None, camera_cy=None,
@@ -604,8 +616,7 @@ class AerialTrackingSystem:
         # )
         
         # 激光检测模块检测器（核心目标）
-        # 当前使用 yolov5s.pt + apple class 临时测试
-        # 未来替换为专用激光模块检测模型（laser_module.pt）
+        # 使用 best.pt 训练权重 + data2_laser.yaml（单类 laser，class 0）
         self.laser_module_detector = YOLOv5Detector(
             weights_path=laser_module_model_path,
             img_size=(640, 640),  # 激光模块目标尺寸适中
@@ -613,13 +624,14 @@ class AerialTrackingSystem:
             iou_thres=0.45, 
             max_det=1,  # 只跟踪单个目标
             device=self.device_str,
-            data='apple_coco.yaml',  # 临时使用COCO配置（apple class 47）
-            classes=[47],  # 临时测试：apple → 未来改为 laser_module
+            data=laser_data_yaml,  # 使用 data2_laser.yaml（nc=1, laser class）
+            classes=None,  # 检测所有类别（模型只有 laser 一类）
             ui=True
         )
         
         print(f"✓ 模型加载完成")
-        print(f"  激光模块检测模型: {laser_module_model_path} (临时使用apple class测试)")
+        print(f"  激光模块检测模型: {laser_module_model_path}")
+        print(f"  数据集配置: {laser_data_yaml}")
         
         # 初始化海康相机
         print("初始化海康相机...")
@@ -686,7 +698,7 @@ class AerialTrackingSystem:
         self._last_control_time = None
         self.max_step_deg_pitch = 3.0  # 单次更新最大步长（度），抑制过冲
         self.max_step_deg_roll = 3.0
-        
+
         # 每隔N帧才进行检测和发送，预留云台调整姿态的时间
         self.frame_interval = 3       # 检测间隔（每N帧检测一次），1=每帧都检测
         self.frame_counter = 0        # 帧计数器
@@ -941,31 +953,14 @@ class AerialTrackingSystem:
         err_pitch_deg = math.degrees(float(pitch_delta))
         err_roll_deg = math.degrees(float(roll_delta))
 
-        # 计算 dt（用于微分项，避免帧率变化导致D项忽大忽小）
-        now_t = time.time()
-        if self._last_control_time is None:
-            dt = 1.0 / 30.0
-        else:
-            dt = max(1e-3, now_t - self._last_control_time)
-        self._last_control_time = now_t
-
-        # D项（刹车）：误差变化率。靠近中心时 err 会变小，此项多为负，起到抑制过冲作用
-        d_pitch = (err_pitch_deg - self._last_err_pitch) / dt
-        d_roll = (err_roll_deg - self._last_err_roll) / dt
-        self._last_err_pitch = err_pitch_deg
-        self._last_err_roll = err_roll_deg
-
-        # 低通滤波D项，抑制检测抖动造成的微分噪声
-        a = float(self.control_d_alpha)
-        self._d_pitch_filt = a * self._d_pitch_filt + (1.0 - a) * d_pitch
-        self._d_roll_filt = a * self._d_roll_filt + (1.0 - a) * d_roll
-
-        # 控制律：上一指令 + (Kp*误差 + Kd*误差变化率)
-        # 注意：这里的“增量”代表这次要把目标角往哪个方向推；D项提供阻尼防过冲
-        inc_pitch = (self.control_gain_pitch * err_pitch_deg) + (self.control_kd_pitch * self._d_pitch_filt)
-        inc_roll = (self.control_gain_roll * err_roll_deg) + (self.control_kd_roll * self._d_roll_filt)
+        # 纯比例控制：target = last_sent + Kp * err
+        # Kp < 1.0：每帧只修正误差的一部分，自然收敛不超调
+        # 步长限制 max_step_deg 兜底防大跳变，死区 deadzone 负责停稳
+        # （不再使用D项——D项量纲是°/s，数值天然比P项大几十倍，导致反向对抗无法收敛）
+        inc_pitch = self.control_gain_pitch * err_pitch_deg
+        inc_roll  = self.control_gain_roll  * err_roll_deg
         target_pitch = self.last_sent_pitch + inc_pitch
-        target_roll = self.last_sent_roll + inc_roll
+        target_roll  = self.last_sent_roll  + inc_roll
 
         # 单次步长限制：避免目标快速变化/噪声导致过冲
         if self.max_step_deg_pitch is not None and self.max_step_deg_pitch > 0:
@@ -993,20 +988,20 @@ class AerialTrackingSystem:
             pitch_change_current = abs(err_pitch_deg)
             roll_change_current = abs(err_roll_deg)
             
-            # 定义衰减区域：当角度偏差小于阈值时开始衰减
-            decay_threshold_pitch = 2.0  # 度
-            decay_threshold_roll = 2.0   # 度
+            # 定义衰减区域：死区的N倍范围内线性衰减速度前馈
+            # 读取配置中的倍数，默认5倍——确保进入死区前速度已接近0，防止冲过头后震荡
+            _vd_mult = getattr(self, '_velocity_decay_multiple', 5.0)
+            decay_threshold_pitch = self.deadzone_pitch * _vd_mult
+            decay_threshold_roll  = self.deadzone_roll  * _vd_mult
             
             # 计算衰减因子（0-1之间，越接近中心越小）
+            # 使用三次方衰减：比平方更激进，在靠近中心时速度迅速趋零
             if pitch_change_current < decay_threshold_pitch:
-                pitch_decay_factor = pitch_change_current / decay_threshold_pitch
-                # 使用平方衰减，更激进地抑制小角度时的速度
-                pitch_decay_factor = pitch_decay_factor ** 2
+                pitch_decay_factor = (pitch_change_current / decay_threshold_pitch) ** 3
                 v_pitch *= pitch_decay_factor
             
             if roll_change_current < decay_threshold_roll:
-                roll_decay_factor = roll_change_current / decay_threshold_roll
-                roll_decay_factor = roll_decay_factor ** 2
+                roll_decay_factor = (roll_change_current / decay_threshold_roll) ** 3
                 v_roll *= roll_decay_factor
 
         # 死区控制：误差角很小时保持上次角度不变，速度设为0
@@ -1107,7 +1102,12 @@ class AerialTrackingSystem:
                 # 读取图像
                 ret, frame = self.camera.read()
                 if not ret:
-                    print("读取图像失败")
+                    # 限频警告，避免刷屏
+                    if not hasattr(self, '_last_read_fail_time') or \
+                            time.time() - self._last_read_fail_time > 2.0:
+                        print("⚠️  读取图像失败，等待相机...")
+                        self._last_read_fail_time = time.time()
+                    time.sleep(0.01)  # 避免空转吃满CPU
                     continue
                 
                 # 初始化画面中心（首帧时设置）
@@ -1455,7 +1455,8 @@ if __name__ == "__main__":
     # 配置参数 ===========================
     # 单模型模式：不需要车辆模型
     VEHICLE_MODEL = config.get('models', {}).get('vehicle', None)
-    ARMOR_MODEL = config.get('models', {}).get('armor', 'models/armor.pt')
+    ARMOR_MODEL = config.get('models', {}).get('armor', 'best.pt')
+    LASER_DATA_YAML = config.get('models', {}).get('data_yaml', 'data2_laser.yaml')
     SERIAL_PORT = config.get('serial', {}).get('port', 'COM8')
     BAUDRATE = config.get('serial', {}).get('baudrate', 115200)
     ENABLE_VELOCITY_FEEDFORWARD = config.get('serial', {}).get('enable_velocity_feedforward', True)
@@ -1507,7 +1508,8 @@ if __name__ == "__main__":
     print(" 无人机激光模块跟踪系统 v2.0 - 卡尔曼预测版 ")
     print("="*60)
     print(f"无人机检测模型: {'(未启用)' if not VEHICLE_MODEL else VEHICLE_MODEL}")
-    print(f"激光模块检测模型: {ARMOR_MODEL} (临时使用apple测试)")
+    print(f"激光模块检测模型: {ARMOR_MODEL}")
+    print(f"数据集配置文件: {LASER_DATA_YAML}")
     print(f"串口: {SERIAL_PORT} @ {BAUDRATE}")
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
@@ -1518,6 +1520,7 @@ if __name__ == "__main__":
         tracker = AerialTrackingSystem(
             aerial_model_path=VEHICLE_MODEL,  # 无人机检测模型（未使用）
             laser_module_model_path=ARMOR_MODEL,  # 激光模块检测模型
+            laser_data_yaml=LASER_DATA_YAML,  # 数据集配置文件
             serial_port=SERIAL_PORT,
             baudrate=BAUDRATE,
             use_gpu=USE_GPU,
@@ -1549,6 +1552,8 @@ if __name__ == "__main__":
             tracker.deadzone_settle_frames = int(dz_cfg['settle_frames'])
         if 'visual_radius' in dz_cfg:
             tracker.deadzone_visual_radius = dz_cfg['visual_radius']
+        if 'velocity_decay_multiple' in dz_cfg:
+            tracker._velocity_decay_multiple = float(dz_cfg['velocity_decay_multiple'])
         
         # 从配置文件读取帧间隔参数
         fi_cfg = config.get('frame_interval', {})

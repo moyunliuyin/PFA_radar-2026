@@ -2,13 +2,14 @@
 # 模型路径
 models:
   # aerial: 'models/aerial.pt'     # 无人机检测模型（第二层策略用，当前未启用）
-  armor: 'yolov5s.pt'              # 激光检测模块模型（临时使用COCO apple测试，未来替换为laser_module.pt）
+  armor: 'best.pt'              # 激光检测模块训练权重
+  data_yaml: 'data2_laser.yaml' # 对应的数据集配置文件（nc=1, names: laser）
   
 # 串口配置
 serial:
-  port: 'COM8'                  # 串口号
-  baudrate: 115200              # 波特率
-  enable_velocity_feedforward: true  # 是否启用速度前馈（发送角速度到下位机）
+  port: 'COM8'
+  baudrate: 115200
+  enable_velocity_feedforward: false  # 禁用速度前馈：大目标运动慢，前馈只会引入超调
 
 # GPU配置
 gpu:
@@ -55,45 +56,36 @@ roi:
 
 # 滤波器配置
 filter:
-  type: 'predictive_kalman'    # 滤波器类型：predictive_kalman（卡尔曼预测）
-
-  # 卡尔曼预测滤波器配置（带延迟补偿）
+  type: 'predictive_kalman'
   predictive_kalman:
-    enabled: true               # 是否启用卡尔曼预测滤波器
-    prediction_time_ms: 230.0   # 预测补偿时间（毫秒）- 降低以提高响应
-    process_noise: 1e-1         # 过程噪声 - 适当增大以更快响应
-    measurement_noise: 8e-2     # 测量噪声 - 降低以更信任测量（减少滞后）
-    max_rate_pitch: 140.0       # pitch最大速率限制（度/秒）- 提高以跟上快速目标
-    max_rate_roll: 120.0        # roll最大速率限制（度/秒）
-    # 调整：运行时按 k/l 键调整预测时间（±20ms）
+    enabled: true
+    prediction_time_ms: 0.0     # 不预测，只做平滑滤波（预测+P控制会互相放大导致震荡）
+    process_noise: 5e-2
+    measurement_noise: 1e-1
+    max_rate_pitch: 120.0
+    max_rate_roll: 120.0
 
 # 死区控制配置
 deadzone:
-  enabled: true                 # 是否启用死区控制
-  pitch: 0.25                   # pitch轴死区阈值（度）- 过大=跟不上，过小=抖动
-  roll: 0.25                    # roll轴死区阈值（度）
-  settle_frames: 3              # 连续在死区内N帧后清零速度，抑制到位摆动
-  visual_radius: 50             # 死区可视化半径（像素），画面上的绿色圈
+  enabled: true
+  pitch: 0.30                   # 10cm目标检测中心稳定，死区不需要太大
+  roll: 0.30
+  settle_frames: 3
+  visual_radius: 45
 
 # 帧间隔控制配置
 frame_interval:
-  enabled: true                 # 是否启用帧间隔控制
-  interval: 3                   # 检测间隔（每N帧检测一次）
+  enabled: false                # 每帧都检测，减少累积延迟
+  interval: 1
 
 # 云台控制
 gimbal:
-  mode: 'absolute'              # 控制模式：'absolute'（绝对角度）
+  mode: 'absolute'
   control:
-    gain_pitch: 0.9             # P增益：越大越跟手，过大易过冲
-    gain_roll: 0.9
-    kd_pitch: 0.2              # D增益：刹车/阻尼，抑制过冲与来回摆
-    kd_roll: 0.2
-    d_alpha: 0.5                # D项低通(0-1)：越大越平滑，越小越敏捷
-    max_step_deg_pitch: 4.0     # 单次更新最大步长（度），抑制过冲/抖动
-    max_step_deg_roll: 4.0
-  # 角度累积说明：
-  # - 程序启动时为初始姿态（0,0）
-  # - 每帧计算偏移角度并累积
+    gain_pitch: 0.20            # 必须很低！防止在途指令累积超调（0.15-0.30之间调）
+    gain_roll: 0.20             # 跟不上→+0.03  超调→-0.03
+    max_step_deg_pitch: 5.0     # 兜底：单帧最大跳变
+    max_step_deg_roll: 5.0
 
 # 目标跟踪
 tracking:
