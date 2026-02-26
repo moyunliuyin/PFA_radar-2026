@@ -68,7 +68,7 @@ filter:
 # 死区控制配置
 deadzone:
   enabled: true
-  pitch: 0.30                   # 10cm目标检测中心稳定，死区不需要太大
+  pitch: 0.40                   # pitch轴死区稍大，抑制上下到位晃动
   roll: 0.30
   settle_frames: 3
   visual_radius: 45
@@ -82,9 +82,9 @@ frame_interval:
 gimbal:
   mode: 'absolute'
   control:
-    gain_pitch: 0.20            # 必须很低！防止在途指令累积超调（0.15-0.30之间调）
-    gain_roll: 0.20             # 跟不上→+0.03  超调→-0.03
-    max_step_deg_pitch: 5.0     # 兜底：单帧最大跳变
+    gain_pitch: 0.28            # pitch降低一点，抑制上下晃动
+    gain_roll: 0.35
+    max_step_deg_pitch: 4.0     # pitch步长收紧一点
     max_step_deg_roll: 5.0
 
 # 目标跟踪
