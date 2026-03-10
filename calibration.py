@@ -165,7 +165,7 @@ class MyUI(QWidget):
         self.map_count = 0
         # 右上角部分
         self.right_top_label = QLabel(self)
-        self.right_top_label.setFixedSize(550, 900)
+        self.right_top_label.setFixedSize(550, 900)  # 初始占位，加载图片后会按比例调整
         self.right_top_label.setStyleSheet("border: 2px solid black;")
         self.right_top_label.mousePressEvent = self.right_top_clicked
 
@@ -197,22 +197,29 @@ class MyUI(QWidget):
             right_image_path = "images-2026/red.jpg"  # 替换为右边图片的路径
         else:
             self.save_path = 'arrays_test_blue.npy'
-            right_image_path = "images-2026/map_blue.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2026/map1.jpg"  # 替换为右边图片的路径
 
         # _,left_image = self.camera_capture.read()
         left_image = camera_image
         right_image = cv2.imread(right_image_path)
 
+        # 根据右侧地图原始比例计算显示尺寸（最大宽550，最大高900）
+        rh, rw = right_image.shape[:2]
+        scale = min(550 / rw, 900 / rh)
+        self.right_display_w = int(rw * scale)
+        self.right_display_h = int(rh * scale)
+        self.right_top_label.setFixedSize(self.right_display_w, self.right_display_h)
+
         # 记录缩放比例
         self.left_scale_x = left_image.shape[1] / 1350.0
         self.left_scale_y = left_image.shape[0] / 1000.0
 
-        self.right_scale_x = right_image.shape[1] / 550.0
-        self.right_scale_y = right_image.shape[0] / 900.0
+        self.right_scale_x = rw / float(self.right_display_w)
+        self.right_scale_y = rh / float(self.right_display_h)
         left_image = cv2.cvtColor(left_image, cv2.COLOR_BGR2RGB)
         self.left_image = cv2.resize(left_image, (1350, 1000))
         right_image = cv2.cvtColor(right_image, cv2.COLOR_BGR2RGB)
-        self.right_image = cv2.resize(right_image, (550, 900))
+        self.right_image = cv2.resize(right_image, (self.right_display_w, self.right_display_h))
         # 缩放图像
         self.update_images()
 

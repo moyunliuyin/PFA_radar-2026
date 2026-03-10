@@ -3,7 +3,7 @@ global:
   camera_mode: 'test'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
   use_serial: False  # 串口启用开关  保证了无串口时能正常调试，虽然没什么影响（有try）
   save_img: False  # 是否保存图像
-  map_size: [2800, 1500]  # 战场地图尺寸
+  map_size: [800, 800]  # 战场地图尺寸
 
   test:
     video_path: ''  # 测试视频（如果没有留空即可，可自动回退到静态图片测试）
@@ -33,9 +33,9 @@ paths:
     blue: 'arrays_test_blue.npy'
   map_images:
     red: 'images-2026/red.jpg'  # 加载红方视角地图
-    blue: 'images-2026/map_blue.jpg'
+    blue: 'images-2026/map1.jpg'
     mask: 'images-2026/map_mask.jpg' # 加载落点判断掩码
-    backup: 'images-2026/image_2026.jpg'
+    backup: 'images-2026/map1.png'
   models:
     car: 'models/car.pt'
     armor: 'models/armor.pt'
@@ -73,5 +73,5 @@ double_vulnerability:
 
 ui:
   info_panel_size: [420, 500]  # 信息面板尺寸
-  map_display_size: [900, 480]  # 地图显示尺寸
-  img_display_size: [1300, 900] # 画面显示尺寸
+  map_display_size: [550, 550]  # 地图显示尺寸
+  img_display_size: [900, 700] # 画面显示尺寸

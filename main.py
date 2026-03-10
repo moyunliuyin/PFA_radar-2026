@@ -26,6 +26,7 @@ with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
     config = yaml.safe_load(f)
 
 state = config['global']['state']  # R:红方/B:蓝方
+map_w, map_h = config['global']['map_size']  # 地图宽高
 assert config['filter']['type'] in ['kalman', 'sliding_window'], "滤波器类型必须为kalman或sliding_window"
 if config['filter']['type'] == 'sliding_window':
     assert 1 <= config['filter']['sliding_window']['window_size'] <= 20, "滑动窗口大小应在1-20之间"
@@ -592,10 +593,10 @@ def ser_send():
     def send_point_B(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
-        filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        filtered_xyz = (map_w - all_filter_data[send_name][1], all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
-        ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
+        ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
         # data = build_data_radar(mapping_table.get(send_name), ser_x, ser_y)
         # packet, seq_s = build_send_packet(data, seq_s, [0x03, 0x05])
@@ -611,10 +612,10 @@ def ser_send():
     def send_point_R(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
-        filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
+        filtered_xyz = (all_filter_data[send_name][1], map_h - all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
-        ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
+        ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
         # data = build_data_radar(mapping_table.get(send_name), ser_x, ser_y)
         # packet, seq_s = build_send_packet(data, seq_s, [0x03, 0x05])
@@ -1354,9 +1355,9 @@ while True:
                 else:
                     color_m = (255, 0, 0)
                 if state == 'R':
-                    filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
+                    filtered_xyz = (map_w - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
                 else:
-                    filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
+                    filtered_xyz = (xyxy[1], map_h - xyxy[0])  # 缩放坐标到地图图像
                 # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
                 if name[0] != state:
                     cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
@@ -1364,7 +1365,7 @@ while True:
                                 (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
                     ser_x = int(filtered_xyz[0]) * 10 / 10
-                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
+                    ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
                     cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
                                 (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)

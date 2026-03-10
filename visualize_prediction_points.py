@@ -6,6 +6,8 @@ import numpy as np
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
+map_w, map_h = config['global']['map_size']  # 地图宽高
+
 # 加载地图图像
 map_image = cv2.imread(config['paths']['map_images']['backup'])
 
@@ -27,7 +29,7 @@ for robot_name, points in prediction_points.items():
     # 绘制该机器人的两个预测点
     for idx, point in enumerate(points):
         x, y = point[0], point[1]
-        y = 1500 - y  # 将y坐标转换为1500减去原始y坐标
+        y = map_h - y  # 将y坐标转换为map_h减去原始y坐标
 
         # 绘制外圈
         cv2.circle(map_image, (int(x), int(y)), 25, color, 4)
