@@ -59,33 +59,33 @@ filter:
   type: 'predictive_kalman'
   predictive_kalman:
     enabled: true
-    prediction_time_ms: 0.0     # 不预测，只做平滑滤波（预测+P控制会互相放大导致震荡）
-    process_noise: 5e-2
-    measurement_noise: 1e-1
+    prediction_time_ms: 20.0    # 适度前向预测补偿管道延迟，同时避免过强阻尼拖慢收敛
+    process_noise: 8e-2         # 提高过程噪声→更信任测量值→更快响应实际位置变化
+    measurement_noise: 6e-2     # 降低测量噪声→减少滤波滞后（原0.1偏保守导致响应迟钝）
     max_rate_pitch: 120.0
     max_rate_roll: 120.0
 
 # 死区控制配置
 deadzone:
   enabled: true
-  pitch: 0.40                   # pitch轴死区稍大，抑制上下到位晃动
-  roll: 0.30
+  pitch: 0.35                   # 略微缩小死区→允许更精细的中心修正
+  roll: 0.25
   settle_frames: 3
   visual_radius: 45
 
 # 帧间隔控制配置
 frame_interval:
-  enabled: false                # 每帧都检测，减少累积延迟
+  enabled: false               
   interval: 1
 
 # 云台控制
 gimbal:
   mode: 'absolute'
   control:
-    gain_pitch: 0.28            # pitch降低一点，抑制上下晃动
-    gain_roll: 0.35
-    max_step_deg_pitch: 4.0     # pitch步长收紧一点
-    max_step_deg_roll: 5.0
+    gain_pitch: 0.35            # 适度提高→每帧修正35%误差（原28%收敛太慢）
+    gain_roll: 0.43             # 适度提高→每帧修正43%误差（原35%收敛太慢）
+    max_step_deg_pitch: 5.5     # 放宽步长限制→大误差时允许更快修正
+    max_step_deg_roll: 7.0      # 放宽步长限制→大误差时允许更快修正
 
 # 目标跟踪
 tracking:

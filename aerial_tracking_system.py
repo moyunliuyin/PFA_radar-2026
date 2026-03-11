@@ -143,8 +143,8 @@ class PredictiveKalmanFilter:
         # 自适应调整过程噪声（基于速度）- pitch轴使用更保守的增益
         v_pitch = abs(self.kf.statePost[2, 0])
         v_roll = abs(self.kf.statePost[3, 0])
-        # pitch轴：降低速度对噪声的影响（除以200而不是100），减少抖动
-        self.kf.processNoiseCov[2, 2] = min(0.3, 1e-3 + v_pitch / 200.0)
+        # pitch轴：适度响应速度变化（除以150，比原200更灵敏但仍保守于roll）
+        self.kf.processNoiseCov[2, 2] = min(0.3, 1e-3 + v_pitch / 150.0)
         # roll轴：保持原有响应性
         self.kf.processNoiseCov[3, 3] = min(0.5, 1e-3 + v_roll / 100.0)
 
@@ -957,8 +957,28 @@ class AerialTrackingSystem:
         # Kp < 1.0：每帧只修正误差的一部分，自然收敛不超调
         # 步长限制 max_step_deg 兜底防大跳变，死区 deadzone 负责停稳
         # （不再使用D项——D项量纲是°/s，数值天然比P项大几十倍，导致反向对抗无法收敛）
-        inc_pitch = self.control_gain_pitch * err_pitch_deg
-        inc_roll  = self.control_gain_roll  * err_roll_deg
+        #
+        # 自适应增益：大误差快追，小误差精稳
+        # 当误差>阈值时逐渐提升增益（最高1.5倍），加速收敛
+        # 当误差<阈值时使用原始增益，保持到位稳定性
+        _boost_thresh = 1.5   # 度：开始boost的误差阈值
+        _max_boost = 1.5      # 最大增益放大倍数
+        _boost_range = 4.5    # 度：达到最大boost的误差范围（阈值+此值时到顶）
+
+        pitch_abs = abs(err_pitch_deg)
+        roll_abs = abs(err_roll_deg)
+        effective_gain_pitch = self.control_gain_pitch
+        effective_gain_roll = self.control_gain_roll
+
+        if pitch_abs > _boost_thresh:
+            ratio = min((pitch_abs - _boost_thresh) / _boost_range, 1.0)
+            effective_gain_pitch *= (1.0 + (_max_boost - 1.0) * ratio)
+        if roll_abs > _boost_thresh:
+            ratio = min((roll_abs - _boost_thresh) / _boost_range, 1.0)
+            effective_gain_roll *= (1.0 + (_max_boost - 1.0) * ratio)
+
+        inc_pitch = effective_gain_pitch * err_pitch_deg
+        inc_roll  = effective_gain_roll  * err_roll_deg
         target_pitch = self.last_sent_pitch + inc_pitch
         target_roll  = self.last_sent_roll  + inc_roll
 

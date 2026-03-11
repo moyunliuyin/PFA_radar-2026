@@ -4,6 +4,7 @@
 # 卡尔曼滤波
 # config
 import datetime
+import os
 import threading
 import time
 import struct
@@ -1245,17 +1246,26 @@ while True:
         """
         将roi_list拼接到若干张canvas_size的画布上，返回画布列表和每个roi在画布中的位置
         每个ROI四周加padding，避免目标贴边
+        对超大ROI进行缩放适配，不再跳过
         """
         canvases = []
-        canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw)]
+        canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw, scale)]
         cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
         cur_rois = []
         x, y, row_h = 0, 0, 0
+        max_w = canvas_size[0] - 2 * padding
+        max_h = canvas_size[1] - 2 * padding
         for idx, roi in enumerate(roi_list):
             h, w = roi.shape[:2]
+            scale = 1.0
+            # 如果ROI超出canvas有效区域，缩放以适配
+            if w > max_w or h > max_h:
+                scale = min(max_w / w, max_h / h)
+                new_w = max(int(w * scale), 1)
+                new_h = max(int(h * scale), 1)
+                roi = cv2.resize(roi, (new_w, new_h))
+                h, w = new_h, new_w
             ph, pw = h + 2 * padding, w + 2 * padding
-            if pw > canvas_size[0] or ph > canvas_size[1]:
-                continue  # 跳过过大的roi
             if x + pw > canvas_size[0]:
                 x = 0
                 y += row_h
@@ -1269,7 +1279,7 @@ while True:
             # 先填充黑色，再放ROI
             cur_canvas[y:y + ph, x:x + pw] = 0
             cur_canvas[y + padding:y + padding + h, x + padding:x + padding + w] = roi
-            cur_rois.append((idx, x + padding, y + padding, w, h, x, y))  # 记录带padding和原始canvas坐标
+            cur_rois.append((idx, x + padding, y + padding, w, h, x, y, scale))  # 增加scale信息
             x += pw
             row_h = max(row_h, ph)
         if cur_rois:
@@ -1288,7 +1298,7 @@ while True:
             result_n = detector_next.predict(canvas)
             canvas_show = canvas.copy()
             # 画出所有ROI内容区域
-            for idx, rx, ry, rw, rh, ox, oy in rois:
+            for idx, rx, ry, rw, rh, ox, oy, scale in rois:
                 cv2.rectangle(canvas_show, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)  # 红色框表示ROI内容
             # 画出所有检测框
             # for detection1 in result_n:
@@ -1299,7 +1309,7 @@ while True:
             cv2.imshow(f'canvas_result_{i}', canvas_show)
 
             # 复原检测框并画到img0上（每个ROI只保留置信度最高的）
-            for idx, rx, ry, rw, rh, ox, oy in rois:
+            for idx, rx, ry, rw, rh, ox, oy, scale in rois:
                 best_det = None
                 best_conf = -1
                 best_xywh = None
@@ -1319,15 +1329,18 @@ while True:
                 if best_det is not None:
                     x, y, w, h = best_xywh
                     left, top, _, _ = roi_pos[idx]
-                    x0 = x - rx + left
-                    y0 = y - ry + top
+                    # 补偿缩放比例，将canvas坐标映射回原图坐标
+                    x0 = (x - rx) / scale + left
+                    y0 = (y - ry) / scale + top
+                    w_orig = w / scale
+                    h_orig = h / scale
                     # 画框
-                    cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 0, 255), 2)
+                    cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w_orig), int(y0 + h_orig)), (255, 0, 255), 2)
                     cv2.putText(img0, f'{best_cls} {best_conf:.2f}', (int(x0), int(y0) - 5), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.7, (255, 0, 255), 2)
                     # 原图中装甲板的中心下沿作为待仿射变化的点
                     t1 = time.time()
-                    camera_point = np.array([[[min(x0 + 0.5 * w, img_x), min(y0 + 1.5 * h, img_y)]]], dtype=np.float32)
+                    camera_point = np.array([[[min(x0 + 0.5 * w_orig, img_x), min(y0 + 1.5 * h_orig, img_y)]]], dtype=np.float32)
                     # 套用仿射变换矩阵（单层）
                     mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
                     X_M = max(int(mapped_point[0][0][0]), 0)

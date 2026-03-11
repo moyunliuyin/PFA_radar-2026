@@ -106,8 +106,8 @@ def hik_camera_get():
           get_Value(cam, param_type="float_value", node_name="AcquisitionFrameRate"))
 
     # 设置设备的一些参数
-    set_Value(cam, param_type="float_value", node_name="ExposureTime", node_value=16000)  # 曝光时间
-    set_Value(cam, param_type="float_value", node_name="Gain", node_value=17.9)  # 增益值
+    set_Value(cam, param_type="float_value", node_name="ExposureTime", node_value=config['camera_params']['exposure_time'])  # 曝光时间
+    set_Value(cam, param_type="float_value", node_name="Gain", node_value=config['camera_params']['gain'])  # 增益值
     # 开启设备取流
     start_grab_and_get_data_size(cam)
     # 主动取流方式抓取图像

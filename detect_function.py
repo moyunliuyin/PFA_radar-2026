@@ -1,8 +1,14 @@
 # 导入需要的库
 import os
 import sys
+import platform
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath, WindowsPath
+
+# Windows下将PosixPath映射到WindowsPath，解决Linux保存的.pt模型在Windows加载报错的问题
+import pathlib
+if platform.system() == 'Windows':
+    pathlib.PosixPath = pathlib.WindowsPath
 
 # 初始化目录
 import cv2
