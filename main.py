@@ -5,6 +5,7 @@
 # config
 import datetime
 import os
+import sys
 import threading
 import time
 import struct
@@ -15,7 +16,14 @@ import serial
 from information_ui import draw_information_ui
 from hik_camera import call_back_get_image, start_grab_and_get_data_size, close_and_destroy_device, set_Value, \
     get_Value, image_control
-from MvImport.MvCameraControl_class import *
+
+if sys.platform.startswith("linux"):
+    from MvImport_Linux.MvCameraControl_class import *
+elif sys.platform.startswith("win"):
+    from MvImport.MvCameraControl_class import *
+else:
+    raise RuntimeError(f"Unsupported platform for MvCameraControl_class: {sys.platform}")
+
 import cv2
 import numpy as np
 from detect_function import YOLOv5Detector
