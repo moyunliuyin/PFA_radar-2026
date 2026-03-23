@@ -681,6 +681,8 @@ class AerialTrackingSystem:
         self.deadzone_visual_radius = 50  # 死区可视化半径（像素），用于画面显示
         self.deadzone_settle_frames = 3   # 连续在死区内N帧后，执行“到位抑摆”
         self._deadzone_streak = 0
+        self.pitch_deadzone_exit_ratio = 1.35  # pitch迟滞：退出阈值=进入阈值*ratio，抑制上下抖动
+        self._pitch_deadzone_latched = False
         print(f"✓ 死区控制已启用 (pitch={self.deadzone_pitch}°, roll={self.deadzone_roll}°, 可视半径={self.deadzone_visual_radius}px)")
 
         # 云台控制律：将“误差角”转为“绝对目标角”
@@ -698,6 +700,11 @@ class AerialTrackingSystem:
         self._last_control_time = None
         self.max_step_deg_pitch = 3.0  # 单次更新最大步长（度），抑制过冲
         self.max_step_deg_roll = 3.0
+        self.command_smooth_pitch = 0.72  # (0,1]，越小越平滑
+        self.command_smooth_roll = 0.88
+        self.pitch_reversal_damping = 0.55   # 小误差换向时抑制pitch来回打舵
+        self.pitch_reversal_window_deg = 1.3
+        self._last_pitch_err_sign = 0
 
         # 每隔N帧才进行检测和发送，预留云台调整姿态的时间
         self.frame_interval = 3       # 检测间隔（每N帧检测一次），1=每帧都检测
@@ -713,6 +720,7 @@ class AerialTrackingSystem:
         
         # 画面中心
         self.frame_center = None
+        self.aim_pixel_offset = (0.0, 0.0)  # (dx,dy) 相对画面中心的固定补偿
         
         # FPS计算
         self.fps_time = time.time()
@@ -917,9 +925,11 @@ class AerialTrackingSystem:
         
         return float(undistorted_point[0][0][0]), float(undistorted_point[0][0][1])
     
-    def pixel_to_angle(self, pixel_x, pixel_y):
+    def pixel_to_angle(self, pixel_x, pixel_y, target_x=None, target_y=None):
         """
         将像素坐标转换为云台控制角度（弧度）
+
+        当提供target_x/target_y时，返回“目标点相对瞄准点”的误差角。
         """
         import math
         
@@ -927,15 +937,22 @@ class AerialTrackingSystem:
         if self.enable_undistort and np.any(self.dist_coeffs):
             pixel_x, pixel_y = self.undistort_point(pixel_x, pixel_y)
         
-        # 步骤2: 计算相对主点的偏移（归一化坐标）
+        # 步骤2: 计算目标点和瞄准点对应光线的角度差
+        if target_x is None:
+            target_x = self.camera_cx
+        if target_y is None:
+            target_y = self.camera_cy
+
         normalized_x = (pixel_x - self.camera_cx) / self.camera_fx
         normalized_y = (pixel_y - self.camera_cy) / self.camera_fy
+        normalized_tx = (target_x - self.camera_cx) / self.camera_fx
+        normalized_ty = (target_y - self.camera_cy) / self.camera_fy
         
         # 步骤3: 计算角度（弧度）
         # 图像坐标系：原点在左上角，X向右为正，Y向下为正
         # 云台控制：Roll左转为正，Pitch上仰为正
-        roll = -math.atan(normalized_x)    # 水平角：目标在左侧为正（向左转）
-        pitch = -math.atan(normalized_y)  # 垂直角：目标在上方为正（向上转）
+        roll = -(math.atan(normalized_x) - math.atan(normalized_tx))
+        pitch = -(math.atan(normalized_y) - math.atan(normalized_ty))
         
         return roll, pitch
     
@@ -977,7 +994,17 @@ class AerialTrackingSystem:
             ratio = min((roll_abs - _boost_thresh) / _boost_range, 1.0)
             effective_gain_roll *= (1.0 + (_max_boost - 1.0) * ratio)
 
+        pitch_sign = 1 if err_pitch_deg > 0 else (-1 if err_pitch_deg < 0 else 0)
+        pitch_reversing = (
+            self._last_pitch_err_sign != 0 and
+            pitch_sign != 0 and
+            pitch_sign != self._last_pitch_err_sign and
+            abs(err_pitch_deg) < self.pitch_reversal_window_deg
+        )
+
         inc_pitch = effective_gain_pitch * err_pitch_deg
+        if pitch_reversing:
+            inc_pitch *= self.pitch_reversal_damping
         inc_roll  = effective_gain_roll  * err_roll_deg
         target_pitch = self.last_sent_pitch + inc_pitch
         target_roll  = self.last_sent_roll  + inc_roll
@@ -991,6 +1018,10 @@ class AerialTrackingSystem:
             dr = target_roll - self.last_sent_roll
             dr = max(-self.max_step_deg_roll, min(self.max_step_deg_roll, dr))
             target_roll = self.last_sent_roll + dr
+
+        # 一阶平滑，降低检测离散和量化带来的命令抖动
+        target_pitch = self.last_sent_pitch + self.command_smooth_pitch * (target_pitch - self.last_sent_pitch)
+        target_roll = self.last_sent_roll + self.command_smooth_roll * (target_roll - self.last_sent_roll)
 
         send_pitch = round(float(target_pitch), 2)
         send_roll = round(float(target_roll), 2)
@@ -1030,7 +1061,19 @@ class AerialTrackingSystem:
         
         in_deadzone = False
         if self.deadzone_enabled:
-            if pitch_err_abs < self.deadzone_pitch and roll_err_abs < self.deadzone_roll:
+            pitch_enter = self.deadzone_pitch
+            pitch_exit = self.deadzone_pitch * self.pitch_deadzone_exit_ratio
+            if self._pitch_deadzone_latched:
+                if pitch_err_abs > pitch_exit:
+                    self._pitch_deadzone_latched = False
+            else:
+                if pitch_err_abs < pitch_enter:
+                    self._pitch_deadzone_latched = True
+
+            pitch_in_zone = self._pitch_deadzone_latched
+            roll_in_zone = roll_err_abs < self.deadzone_roll
+
+            if pitch_in_zone and roll_in_zone:
                 in_deadzone = True
                 self.deadzone_skip_count += 1
                 self._deadzone_streak += 1
@@ -1059,6 +1102,8 @@ class AerialTrackingSystem:
             # 未启用死区时：始终更新上次发送角度
             self.last_sent_pitch = send_pitch
             self.last_sent_roll = send_roll
+
+        self._last_pitch_err_sign = pitch_sign
 
         # 同步记录云台绝对姿态（用于UI显示）
         self.gimbal_pose.set_pose(self.last_sent_pitch, self.last_sent_roll)
@@ -1179,10 +1224,14 @@ class AerialTrackingSystem:
                         # 使用装甲板中心的像素坐标（相对画面左上角）
                         pixel_x = float(center[0])
                         pixel_y = float(center[1])
+
+                        # 补偿后的瞄准点：相对画面中心平移(dx,dy)
+                        aim_x = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
+                        aim_y = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
                         
-                        # 像素坐标转换为云台角度（弧度）
+                        # 像素坐标转换为云台误差角（弧度）
                         # 内部会自动处理畸变校正和主点偏移
-                        roll_raw, pitch_raw = self.pixel_to_angle(pixel_x, pixel_y)
+                        roll_raw, pitch_raw = self.pixel_to_angle(pixel_x, pixel_y, aim_x, aim_y)
                         
                         # 转换为角度制
                         import math
@@ -1199,9 +1248,9 @@ class AerialTrackingSystem:
                         roll_filtered = math.radians(roll_deg_filtered)
                         pitch_filtered = math.radians(pitch_deg_filtered)
                         
-                        # 计算像素偏移量（仅用于显示）
-                        pixel_offset_x = pixel_x - self.frame_center[0]
-                        pixel_offset_y = pixel_y - self.frame_center[1]
+                        # 计算相对“补偿后瞄准点”的像素误差（用于显示）
+                        pixel_offset_x = pixel_x - aim_x
+                        pixel_offset_y = pixel_y - aim_y
                         
                         # 发送云台控制角到下位机（使用滤波后的角度）
                         self.send_gimbal_control(roll_filtered, pitch_filtered)
@@ -1216,7 +1265,9 @@ class AerialTrackingSystem:
                             'roll_deg_filtered': roll_deg_filtered,
                             'roll_deg_raw': roll_deg_raw,
                             'pixel_offset_x': pixel_offset_x,
-                            'pixel_offset_y': pixel_offset_y
+                            'pixel_offset_y': pixel_offset_y,
+                            'aim_x': aim_x,
+                            'aim_y': aim_y
                         }
                     else:
                         # 非检测帧：使用缓存的显示数据
@@ -1227,10 +1278,14 @@ class AerialTrackingSystem:
                             roll_deg_raw = self._display_data['roll_deg_raw']
                             pixel_offset_x = self._display_data['pixel_offset_x']
                             pixel_offset_y = self._display_data['pixel_offset_y']
+                            aim_x = self._display_data.get('aim_x', float(self.frame_center[0]))
+                            aim_y = self._display_data.get('aim_y', float(self.frame_center[1]))
                         else:
                             pitch_deg_filtered = pitch_deg_raw = 0
                             roll_deg_filtered = roll_deg_raw = 0
                             pixel_offset_x = pixel_offset_y = 0
+                            aim_x = float(self.frame_center[0])
+                            aim_y = float(self.frame_center[1])
                     
                     # 可视化 - 绘制检测框
                     # 无人机框（第二层策略用，当前未启用）
@@ -1253,8 +1308,8 @@ class AerialTrackingSystem:
                               (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 
                               0.6, method_color, 2)
                     
-                    # 激光模块中心点（红色）
-                    cv2.circle(frame, center, 5, (0, 0, 255), -1)
+                    # # 激光模块中心点（红色）
+                    # cv2.circle(frame, center, 5, (0, 0, 255), -1)
                     
                     # # 绘制轨迹
                     # for i in range(1, len(self.trajectory)):
@@ -1289,18 +1344,25 @@ class AerialTrackingSystem:
                               (0, 0, 255), 2)
                 
                 self.total_frames += 1
+
+                aim_draw = (
+                    int(round(self.frame_center[0] + self.aim_pixel_offset[0])),
+                    int(round(self.frame_center[1] + self.aim_pixel_offset[1]))
+                )
                 
-                # 画面中心十字线
+                # 画面中心十字线（白色）
                 cv2.line(frame, (self.frame_center[0]-20, self.frame_center[1]), 
-                        (self.frame_center[0]+20, self.frame_center[1]), (255, 255, 255), 2)
+                    (self.frame_center[0]+20, self.frame_center[1]), (255, 255, 255), 2)
                 cv2.line(frame, (self.frame_center[0], self.frame_center[1]-20), 
-                        (self.frame_center[0], self.frame_center[1]+20), (255, 255, 255), 2)
+                    (self.frame_center[0], self.frame_center[1]+20), (255, 255, 255), 2)
                 cv2.circle(frame, self.frame_center, 3, (255, 255, 255), -1)
-                
-                # 绘制死区可视化圈（绿色圆圈）
+
+                # 补偿后瞄准点（青色十字）与死区圈
+                cv2.drawMarker(frame, aim_draw, (255, 255, 0), markerType=cv2.MARKER_CROSS,
+                               markerSize=24, thickness=2)
                 if self.deadzone_enabled:
-                    cv2.circle(frame, self.frame_center, int(self.deadzone_visual_radius), 
-                              (0, 255, 0), 2)
+                    cv2.circle(frame, aim_draw, int(self.deadzone_visual_radius),
+                               (0, 255, 0), 2)
                 
                 # 计算FPS
                 current_time = time.time()
@@ -1384,6 +1446,7 @@ class AerialTrackingSystem:
                         print(f"死区控制: {'启用' if self.deadzone_enabled else '禁用'}")
                         print(f"  Pitch死区: {self.deadzone_pitch:.2f}°")
                         print(f"  Roll死区: {self.deadzone_roll:.2f}°")
+                        print(f"  Pitch迟滞退出倍率: {self.pitch_deadzone_exit_ratio:.2f}x")
                         print(f"  跳过发送次数: {self.deadzone_skip_count}")
                         print(f"帧间隔控制: {'启用' if self.interval_enabled else '禁用'}")
                         print(f"  检测间隔: 每{self.frame_interval}帧")
@@ -1391,6 +1454,9 @@ class AerialTrackingSystem:
                         print(f"  Kp: pitch={self.control_gain_pitch:.2f}, roll={self.control_gain_roll:.2f}")
                         print(f"  Kd: pitch={self.control_kd_pitch:.2f}, roll={self.control_kd_roll:.2f} (D-alpha={self.control_d_alpha:.2f})")
                         print(f"  步长限制: pitch={self.max_step_deg_pitch:.2f}°, roll={self.max_step_deg_roll:.2f}°")
+                        print(f"  命令平滑: pitch={self.command_smooth_pitch:.2f}, roll={self.command_smooth_roll:.2f}")
+                        print(f"  Pitch换向抑制: {self.pitch_reversal_damping:.2f} (窗口={self.pitch_reversal_window_deg:.2f}°)")
+                        print(f"像素补偿: dx={self.aim_pixel_offset[0]:.1f}px, dy={self.aim_pixel_offset[1]:.1f}px")
                         print(f"相机线程: {'启用' if self.use_camera_thread else '禁用'}")
                         if self.use_camera_thread:
                             frame_cnt = self.camera.get_frame_count()
@@ -1534,6 +1600,7 @@ if __name__ == "__main__":
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
     print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
+    print(f"像素补偿: {config.get('pixel_offset', [0.0, 0.0])}")
     print("="*60)
 
     try:
@@ -1574,6 +1641,8 @@ if __name__ == "__main__":
             tracker.deadzone_visual_radius = dz_cfg['visual_radius']
         if 'velocity_decay_multiple' in dz_cfg:
             tracker._velocity_decay_multiple = float(dz_cfg['velocity_decay_multiple'])
+        if 'pitch_exit_ratio' in dz_cfg:
+            tracker.pitch_deadzone_exit_ratio = max(1.0, float(dz_cfg['pitch_exit_ratio']))
         
         # 从配置文件读取帧间隔参数
         fi_cfg = config.get('frame_interval', {})
@@ -1609,6 +1678,20 @@ if __name__ == "__main__":
                 tracker.max_step_deg_pitch = float(ctrl_cfg['max_step_deg_pitch'])
             if 'max_step_deg_roll' in ctrl_cfg:
                 tracker.max_step_deg_roll = float(ctrl_cfg['max_step_deg_roll'])
+            if 'smooth_pitch' in ctrl_cfg:
+                tracker.command_smooth_pitch = min(1.0, max(0.05, float(ctrl_cfg['smooth_pitch'])))
+            if 'smooth_roll' in ctrl_cfg:
+                tracker.command_smooth_roll = min(1.0, max(0.05, float(ctrl_cfg['smooth_roll'])))
+            if 'pitch_reversal_damping' in ctrl_cfg:
+                tracker.pitch_reversal_damping = min(1.0, max(0.1, float(ctrl_cfg['pitch_reversal_damping'])))
+            if 'pitch_reversal_window_deg' in ctrl_cfg:
+                tracker.pitch_reversal_window_deg = max(0.2, float(ctrl_cfg['pitch_reversal_window_deg']))
+
+        # 像素补偿：激光点相对画面中心的固定偏差(dx,dy)
+        po_cfg = config.get('pixel_offset', [0.0, 0.0])
+        if isinstance(po_cfg, (list, tuple)) and len(po_cfg) >= 2:
+            tracker.aim_pixel_offset = (float(po_cfg[0]), float(po_cfg[1]))
+        print(f"✓ 像素补偿已应用: dx={tracker.aim_pixel_offset[0]:.1f}px, dy={tracker.aim_pixel_offset[1]:.1f}px")
         
         print("\n按键说明:")
         print("  q - 退出程序")

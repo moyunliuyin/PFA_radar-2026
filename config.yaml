@@ -41,8 +41,8 @@ paths:
     armor: 'models/armor.pt'
 
 camera_params:
-  exposure_time: 61217.0 # 曝光时间
-  gain: 11.7 # 增益值
+  exposure_time: 341173.0 # 曝光时间
+  gain: 14.9 # 增益值
 
 kalman:
   process_noise: 1e-5

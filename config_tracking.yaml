@@ -3,7 +3,7 @@
 models:
   # aerial: 'models/aerial.pt'     # 无人机检测模型（第二层策略用，当前未启用）
   armor: 'best.pt'              # 激光检测模块训练权重
-  data_yaml: 'data2_laser.yaml' # 对应的数据集配置文件（nc=1, names: laser）
+  data_yaml: 'laser.yaml' # 对应的数据集配置文件（nc=1, names: laser）
   
 # 串口配置
 serial:
@@ -17,8 +17,8 @@ gpu:
 
 # 相机采集参数
 camera:
-  exposure_time: 55915.0        # 曝光时间（微秒）35000 = 35ms
-  gain: 10                      # 增益（dB），范围 0-24
+  exposure_time: 52915.0        # 曝光时间（微秒）35000 = 35ms
+  gain: 3                      # 增益（dB），范围 0-24
   use_thread: true              # 独立线程采集（减少read阻塞，提高FPS稳定性）
   
 # 相机标定参数
@@ -44,7 +44,7 @@ detector:
     max_det: 14                 # 最大检测数
   armor:
     img_size: [384, 384]        # 输入图像尺寸（平衡精度与速度）
-    conf_thres: 0.10            # 置信度阈值
+    conf_thres: 0.60            # 置信度阈值
     iou_thres: 0.40             # NMS IOU阈值
     max_det: 1                  # 最大检测数（优先最高置信度）
 
@@ -59,19 +59,23 @@ filter:
   type: 'predictive_kalman'
   predictive_kalman:
     enabled: true
-    prediction_time_ms: 20.0    # 适度前向预测补偿管道延迟，同时避免过强阻尼拖慢收敛
-    process_noise: 8e-2         # 提高过程噪声→更信任测量值→更快响应实际位置变化
-    measurement_noise: 6e-2     # 降低测量噪声→减少滤波滞后（原0.1偏保守导致响应迟钝）
+    prediction_time_ms: 25.0    # 适度前向预测补偿管道延迟，同时避免过强阻尼拖慢收敛
+    process_noise: 8        # 提高过程噪声→更信任测量值→更快响应实际位置变化
+    measurement_noise: 6e-1     # 降低测量噪声→减少滤波滞后（原0.1偏保守导致响应迟钝）
     max_rate_pitch: 120.0
     max_rate_roll: 120.0
 
 # 死区控制配置
 deadzone:
   enabled: true
-  pitch: 0.35                   # 略微缩小死区→允许更精细的中心修正
-  roll: 0.25
+  pitch: 0.13                   # 略微缩小死区→允许更精细的中心修正
+  roll: 0.13
   settle_frames: 3
   visual_radius: 45
+  pitch_exit_ratio: 1.25        # pitch死区迟滞退出倍率（>1可显著减小上下边界抖动）
+
+# 像素补偿：改变最终相机停留位置
+pixel_offset: [67.0, -200.0]    # 像素补偿(dx,dy)：激光点相对画面中心的固定偏差（右/下为正）
 
 # 帧间隔控制配置
 frame_interval:
@@ -82,10 +86,14 @@ frame_interval:
 gimbal:
   mode: 'absolute'
   control:
-    gain_pitch: 0.35            # 适度提高→每帧修正35%误差（原28%收敛太慢）
+    gain_pitch: 0.37            # 适度提高→每帧修正35%误差（原28%收敛太慢）
     gain_roll: 0.43             # 适度提高→每帧修正43%误差（原35%收敛太慢）
-    max_step_deg_pitch: 5.5     # 放宽步长限制→大误差时允许更快修正
+    max_step_deg_pitch: 3.3     # 放宽步长限制→大误差时允许更快修正
     max_step_deg_roll: 7.0      # 放宽步长限制→大误差时允许更快修正
+    smooth_pitch: 0.72          # pitch命令平滑系数，减小上下抖动（越小越稳）
+    smooth_roll: 0.88           # roll可稍激进，兼顾响应
+    pitch_reversal_damping: 0.55 # pitch误差小范围换向时抑制系数，防止来回打舵
+    pitch_reversal_window_deg: 1.30
 
 # 目标跟踪
 tracking:
