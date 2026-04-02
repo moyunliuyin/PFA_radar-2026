@@ -159,13 +159,15 @@ class MyUI(QWidget):
         self.left_top_label.setFixedSize(1350, 1000)
         self.left_top_label.setStyleSheet("border: 2px solid black;")
         self.left_top_label.mousePressEvent = self.left_top_clicked
-        self.image_points = [[(0, 0), (0, 0), (0, 0), (0, 0)]]
-        self.map_points = [[(0, 0), (0, 0), (0, 0), (0, 0)]]
+        self.image_points = [[(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)],
+                             [(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)]]
+        self.map_points = [[(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)],
+                           [(0, 0), (0, 0), (0, 0), (0, 0)], [(0, 0), (0, 0), (0, 0), (0, 0)]]
         self.image_count = 0
         self.map_count = 0
         # 右上角部分
         self.right_top_label = QLabel(self)
-        self.right_top_label.setFixedSize(550, 900)  # 初始占位，加载图片后会按比例调整
+        self.right_top_label.setFixedSize(550, 900)
         self.right_top_label.setStyleSheet("border: 2px solid black;")
         self.right_top_label.mousePressEvent = self.right_top_clicked
 
@@ -180,7 +182,6 @@ class MyUI(QWidget):
 
         self.button2 = QPushButton('切换高度', self)
         self.button2.setFixedSize(100, 30)
-        self.button2.setEnabled(False)  # 单层地图无需切换高度
         self.button2.clicked.connect(self.button2_clicked)
 
         self.button3 = QPushButton('加载坐标', self)
@@ -197,29 +198,22 @@ class MyUI(QWidget):
             right_image_path = "images-2026/red.jpg"  # 替换为右边图片的路径
         else:
             self.save_path = 'arrays_test_blue.npy'
-            right_image_path = "images-2026/map1.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2026/map_blue.jpg"  # 替换为右边图片的路径
 
         # _,left_image = self.camera_capture.read()
         left_image = camera_image
         right_image = cv2.imread(right_image_path)
 
-        # 根据右侧地图原始比例计算显示尺寸（最大宽550，最大高900）
-        rh, rw = right_image.shape[:2]
-        scale = min(550 / rw, 900 / rh)
-        self.right_display_w = int(rw * scale)
-        self.right_display_h = int(rh * scale)
-        self.right_top_label.setFixedSize(self.right_display_w, self.right_display_h)
-
         # 记录缩放比例
         self.left_scale_x = left_image.shape[1] / 1350.0
         self.left_scale_y = left_image.shape[0] / 1000.0
 
-        self.right_scale_x = rw / float(self.right_display_w)
-        self.right_scale_y = rh / float(self.right_display_h)
+        self.right_scale_x = right_image.shape[1] / 550.0
+        self.right_scale_y = right_image.shape[0] / 900.0
         left_image = cv2.cvtColor(left_image, cv2.COLOR_BGR2RGB)
         self.left_image = cv2.resize(left_image, (1350, 1000))
         right_image = cv2.cvtColor(right_image, cv2.COLOR_BGR2RGB)
-        self.right_image = cv2.resize(right_image, (self.right_display_w, self.right_display_h))
+        self.right_image = cv2.resize(right_image, (550, 900))
         # 缩放图像
         self.update_images()
 
@@ -325,9 +319,12 @@ class MyUI(QWidget):
         print('开始标定')
 
     def button2_clicked(self):
-        # 单层地图，无需切换高度
-        self.append_text('单层地图无需切换高度')
-        print('单层地图无需切换高度')
+        # 按钮2点击事件
+        self.append_text('切换高度')
+        self.image_count = 0
+        self.map_count = 0
+        self.height = (self.height + 1) % 2
+        print('切换高度')
 
     def button3_clicked(self):
         # 按钮3点击事件
@@ -336,12 +333,13 @@ class MyUI(QWidget):
         print('加载坐标')
 
     def button4_clicked(self):
-        # 按钮4点击事件（保存计算）
+        # 按钮4点击事件
         print(self.image_points)
         print(self.map_points)
-        image_point = np.array(self.image_points[0], dtype=np.float32)
-        map_point = np.array(self.map_points[0], dtype=np.float32)
-        self.T = [cv2.getPerspectiveTransform(image_point, map_point)]
+        for i in range(0, 2):
+            image_point = np.array(self.image_points[i], dtype=np.float32)
+            map_point = np.array(self.map_points[i], dtype=np.float32)
+            self.T.append(cv2.getPerspectiveTransform(image_point, map_point))
 
         np.save(self.save_path, self.T)
 

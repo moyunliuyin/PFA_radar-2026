@@ -5,6 +5,7 @@
 # config
 import datetime
 import os
+import sys
 import threading
 import time
 import struct
@@ -15,7 +16,13 @@ import serial
 from information_ui import draw_information_ui
 from hik_camera import call_back_get_image, start_grab_and_get_data_size, close_and_destroy_device, set_Value, \
     get_Value, image_control
-from MvImport.MvCameraControl_class import *
+
+if sys.platform.startswith("linux"):
+    from MvImport_Linux.MvCameraControl_class import *
+elif sys.platform.startswith("win"):
+    from MvImport.MvCameraControl_class import *
+else:
+    raise RuntimeError(f"Unsupported platform for MvCameraControl_class: {sys.platform}")
 import cv2
 import numpy as np
 from detect_function import YOLOv5Detector
@@ -27,7 +34,6 @@ with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
     config = yaml.safe_load(f)
 
 state = config['global']['state']  # R:红方/B:蓝方
-map_w, map_h = config['global']['map_size']  # 地图宽高
 assert config['filter']['type'] in ['kalman', 'sliding_window'], "滤波器类型必须为kalman或sliding_window"
 if config['filter']['type'] == 'sliding_window':
     assert 1 <= config['filter']['sliding_window']['window_size'] <= 20, "滑动窗口大小应在1-20之间"
@@ -58,13 +64,15 @@ else:
     loaded_arrays = np.load(config['paths']['calibration']['blue'])
     map_image = cv2.imread(config['paths']['map_images']['blue'])
 
+mask_image = cv2.imread(config['paths']['map_images']['mask'])
 map_backup = cv2.imread(config['paths']['map_images']['backup'])
 
-# 导入仿射变换矩阵（单层）
-M_ground = loaded_arrays[0]  # 地面层
+# 导入战场每个高度的不同仿射变化矩阵
+M_ground = loaded_arrays[0]  # 地面层、公路层
+M_height_r = loaded_arrays[1]  # 中央高地
 
 # 确定地图画面像素，保证不会溢出
-height, width = map_backup.shape[:2]
+height, width = mask_image.shape[:2]
 height -= 1
 width -= 1
 
@@ -161,14 +169,10 @@ mapping_table = {
     "B7": 107
 }
 
-# 盲区预测开关
-blind_zone_enabled = config['blind_zone'].get('enabled', True)
-
 # 盲区预测点位
 guess_table = {}
-if blind_zone_enabled:
-    for robot, points in config['blind_zone']['points'].items():
-        guess_table[robot] = [tuple(point) for point in points]
+for robot, points in config['blind_zone']['points'].items():
+    guess_table[robot] = [tuple(point) for point in points]
 
 
 class KalmanFilter:
@@ -594,10 +598,10 @@ def ser_send():
     def send_point_B(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
-        filtered_xyz = (map_w - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
-        ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
+        ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
         # data = build_data_radar(mapping_table.get(send_name), ser_x, ser_y)
         # packet, seq_s = build_send_packet(data, seq_s, [0x03, 0x05])
@@ -613,10 +617,10 @@ def ser_send():
     def send_point_R(send_name, all_filter_data):
         # front_time = time.time()
         # 转换为地图坐标系
-        filtered_xyz = (all_filter_data[send_name][1], map_h - all_filter_data[send_name][0])
+        filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
-        ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
+        ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
         # 打包坐标数据包
         # data = build_data_radar(mapping_table.get(send_name), ser_x, ser_y)
         # packet, seq_s = build_send_packet(data, seq_s, [0x03, 0x05])
@@ -923,8 +927,9 @@ def ser_send():
                     send_map['B5'] = (0, 0)
 
                 # 哨兵
-                if blind_zone_enabled and guess_list.get('B7'):
+                if guess_list.get('B7'):
                     send_map['B7'] = send_point_guess('B7', guess_time_limit)
+                # 未识别到哨兵，进行盲区预测
                 else:
                     if all_filter_data.get('B7', False):
                         send_map['B7'] = send_point_B('B7', all_filter_data)
@@ -963,8 +968,9 @@ def ser_send():
                     send_map['R5'] = (0, 0)
 
                 # 哨兵
-                if blind_zone_enabled and guess_list.get('R7'):
+                if guess_list.get('R7'):
                     send_map['R7'] = send_point_guess('R7', guess_time_limit)
+                # 未识别到哨兵，进行盲区预测
                 else:
                     if all_filter_data.get('R7', False):
                         send_map['R7'] = send_point_R('R7', all_filter_data)
@@ -1246,26 +1252,17 @@ while True:
         """
         将roi_list拼接到若干张canvas_size的画布上，返回画布列表和每个roi在画布中的位置
         每个ROI四周加padding，避免目标贴边
-        对超大ROI进行缩放适配，不再跳过
         """
         canvases = []
-        canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw, scale)]
+        canvas_rois = []  # 每个画布上的roi信息: [(roi_idx, x_with_pad, y_with_pad, w, h, x_raw, y_raw)]
         cur_canvas = np.zeros((canvas_size[1], canvas_size[0], 3), dtype=np.uint8)
         cur_rois = []
         x, y, row_h = 0, 0, 0
-        max_w = canvas_size[0] - 2 * padding
-        max_h = canvas_size[1] - 2 * padding
         for idx, roi in enumerate(roi_list):
             h, w = roi.shape[:2]
-            scale = 1.0
-            # 如果ROI超出canvas有效区域，缩放以适配
-            if w > max_w or h > max_h:
-                scale = min(max_w / w, max_h / h)
-                new_w = max(int(w * scale), 1)
-                new_h = max(int(h * scale), 1)
-                roi = cv2.resize(roi, (new_w, new_h))
-                h, w = new_h, new_w
             ph, pw = h + 2 * padding, w + 2 * padding
+            if pw > canvas_size[0] or ph > canvas_size[1]:
+                continue  # 跳过过大的roi
             if x + pw > canvas_size[0]:
                 x = 0
                 y += row_h
@@ -1279,7 +1276,7 @@ while True:
             # 先填充黑色，再放ROI
             cur_canvas[y:y + ph, x:x + pw] = 0
             cur_canvas[y + padding:y + padding + h, x + padding:x + padding + w] = roi
-            cur_rois.append((idx, x + padding, y + padding, w, h, x, y, scale))  # 增加scale信息
+            cur_rois.append((idx, x + padding, y + padding, w, h, x, y))  # 记录带padding和原始canvas坐标
             x += pw
             row_h = max(row_h, ph)
         if cur_rois:
@@ -1298,7 +1295,7 @@ while True:
             result_n = detector_next.predict(canvas)
             canvas_show = canvas.copy()
             # 画出所有ROI内容区域
-            for idx, rx, ry, rw, rh, ox, oy, scale in rois:
+            for idx, rx, ry, rw, rh, ox, oy in rois:
                 cv2.rectangle(canvas_show, (rx, ry), (rx + rw, ry + rh), (0, 0, 255), 2)  # 红色框表示ROI内容
             # 画出所有检测框
             # for detection1 in result_n:
@@ -1309,7 +1306,7 @@ while True:
             cv2.imshow(f'canvas_result_{i}', canvas_show)
 
             # 复原检测框并画到img0上（每个ROI只保留置信度最高的）
-            for idx, rx, ry, rw, rh, ox, oy, scale in rois:
+            for idx, rx, ry, rw, rh, ox, oy in rois:
                 best_det = None
                 best_conf = -1
                 best_xywh = None
@@ -1329,24 +1326,37 @@ while True:
                 if best_det is not None:
                     x, y, w, h = best_xywh
                     left, top, _, _ = roi_pos[idx]
-                    # 补偿缩放比例，将canvas坐标映射回原图坐标
-                    x0 = (x - rx) / scale + left
-                    y0 = (y - ry) / scale + top
-                    w_orig = w / scale
-                    h_orig = h / scale
+                    x0 = x - rx + left
+                    y0 = y - ry + top
                     # 画框
-                    cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w_orig), int(y0 + h_orig)), (255, 0, 255), 2)
+                    cv2.rectangle(img0, (int(x0), int(y0)), (int(x0 + w), int(y0 + h)), (255, 0, 255), 2)
                     cv2.putText(img0, f'{best_cls} {best_conf:.2f}', (int(x0), int(y0) - 5), cv2.FONT_HERSHEY_SIMPLEX,
                                 0.7, (255, 0, 255), 2)
                     # 原图中装甲板的中心下沿作为待仿射变化的点
                     t1 = time.time()
-                    camera_point = np.array([[[min(x0 + 0.5 * w_orig, img_x), min(y0 + 1.5 * h_orig, img_y)]]], dtype=np.float32)
-                    # 套用仿射变换矩阵（单层）
+                    camera_point = np.array([[[min(x0 + 0.5 * w, img_x), min(y0 + 1.5 * h, img_y)]]], dtype=np.float32)
+                    # 先套用地面层仿射变化矩阵
                     mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_ground)
-                    X_M = max(int(mapped_point[0][0][0]), 0)
-                    Y_M = max(int(mapped_point[0][0][1]), 0)
-                    X_M = min(X_M, width)
-                    Y_M = min(Y_M, height)
+                    x_c = max(int(mapped_point[0][0][0]), 0)
+                    y_c = max(int(mapped_point[0][0][1]), 0)
+                    x_c = min(x_c, width)
+                    y_c = min(y_c, height)
+                    color = mask_image[y_c, x_c]  # 通过掩码图像，获取地面层的颜色：黑（0，0，0）
+                    if color[0] == color[1] == color[2] == 0:
+                        X_M = x_c
+                        Y_M = y_c
+                        # Z_M = 0
+                    else:
+                        # 不满足则继续套用R型高地层仿射变换矩阵
+                        mapped_point = cv2.perspectiveTransform(camera_point.reshape(1, 1, 2), M_height_r)
+                        x_c = max(int(mapped_point[0][0][0]), 0)
+                        y_c = max(int(mapped_point[0][0][1]), 0)
+                        x_c = min(x_c, width)
+                        y_c = min(y_c, height)
+                        color = mask_image[y_c, x_c]  # 通过掩码图像，获取R型高地层的颜色：绿（0，255，0）
+                        X_M = x_c
+                        Y_M = y_c
+                        # Z_M = 400
                     if isinstance(filter, SlidingWindowFilter):
                         # 滑动窗口需要完整坐标序列
                         filter.add_data(best_cls, X_M, Y_M)
@@ -1368,9 +1378,9 @@ while True:
                 else:
                     color_m = (255, 0, 0)
                 if state == 'R':
-                    filtered_xyz = (map_w - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
+                    filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
                 else:
-                    filtered_xyz = (xyxy[1], map_h - xyxy[0])  # 缩放坐标到地图图像
+                    filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
                 # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
                 if name[0] != state:
                     cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
@@ -1378,7 +1388,7 @@ while True:
                                 (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
                                 cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
                     ser_x = int(filtered_xyz[0]) * 10 / 10
-                    ser_y = int(map_h - filtered_xyz[1]) * 10 / 10
+                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
                     cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
                                 (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
