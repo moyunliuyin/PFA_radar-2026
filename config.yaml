@@ -6,7 +6,7 @@ global:
   map_size: [2800, 1500]  # 战场地图尺寸
 
   test:
-    video_path: ''  # 测试视频（如果没有留空即可，可自动回退到静态图片测试）
+    video_path: 'raw\screen.mp4'  # 测试视频（如果没有留空即可，可自动回退到静态图片测试）
     loop: False  # 是否循环播放
     start_frame: 0  # 起始帧号
     playback_speed: 3.0  # 播放速度（1.0=正常速度）
@@ -17,13 +17,25 @@ serial: # 串口
   timeout: 1
 
 filter:
-  type: "sliding_window"  # 可选值：kalman/sliding_window
+  type: "sliding_window"  # 可选值：sliding_window/hybrid_gated_kalman(hybrid)
   sliding_window:
     window_size: 5  # 滑动窗口大小
     max_inactive_time: 2.0 # 滤波器最大不活跃时间(秒)
     threshold: 100000.0
-  kalman:
+  hybrid_gated_kalman:
+    prefilter_window: 3  # 预滤波窗口，建议3-4
+    prefilter_mode: 'median'  # median/mean
     max_inactive_time: 2.0
+    raw_jump_threshold: 120.0  # 原始观测跳变门限（像素）
+    pred_jump_threshold: 100.0  # 相对预测跳变门限（像素）
+    process_noise: 1e-5
+    measurement_noise: 1e-1
+
+filter_compare:
+  enabled: true  # true时启用影子对比滤波，不参与串口发送
+  compare_type: 'hybrid_gated_kalman'  # auto/sliding_window/hybrid_gated_kalman
+  draw_on_map: true
+  show_delta_text: true
 
 paths:
   # test_img: 'images/test1.jpg' # 测试图片
@@ -43,10 +55,6 @@ paths:
 camera_params:
   exposure_time: 16000.0 # 曝光时间
   gain: 17.9 # 增益值
-
-kalman:
-  process_noise: 1e-5
-  measurement_noise: 1e-1
 
 blind_zone:
   enabled: false  # 盲区预测开关（单层地图建议关闭）
@@ -74,4 +82,4 @@ double_vulnerability:
 ui:
   info_panel_size: [420, 500]  # 信息面板尺寸
   map_display_size: [900, 480]  # 地图显示尺寸
-  img_display_size: [1300, 900] # 画面显示尺寸
+  img_display_size: [980, 700] # 画面显示尺寸

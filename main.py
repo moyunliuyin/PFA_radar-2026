@@ -34,7 +34,8 @@ with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
     config = yaml.safe_load(f)
 
 state = config['global']['state']  # R:红方/B:蓝方
-assert config['filter']['type'] in ['kalman', 'sliding_window'], "滤波器类型必须为kalman或sliding_window"
+assert config['filter']['type'] in ['sliding_window', 'hybrid_gated_kalman', 'hybrid'], \
+    "滤波器类型必须为sliding_window/hybrid_gated_kalman/hybrid"
 if config['filter']['type'] == 'sliding_window':
     assert 1 <= config['filter']['sliding_window']['window_size'] <= 20, "滑动窗口大小应在1-20之间"
 # 图像测试模式（获取图像根据自己的设备，在）
@@ -55,6 +56,11 @@ else:
     ser1 = None
     print("串口功能已禁用")
 save_img = config['global']['save_img']
+compare_cfg = config.get('filter_compare', {})
+compare_enabled = bool(compare_cfg.get('enabled', False))
+compare_draw = bool(compare_cfg.get('draw_on_map', True))
+compare_text = bool(compare_cfg.get('show_delta_text', True))
+compare_type = str(compare_cfg.get('compare_type', 'hybrid_gated_kalman'))
 
 # 文件路径配置
 if state == 'R':
@@ -175,146 +181,55 @@ for robot, points in config['blind_zone']['points'].items():
     guess_table[robot] = [tuple(point) for point in points]
 
 
-class KalmanFilter:
+class MotionKalman2D:
     def __init__(self, process_noise=1e-5, measurement_noise=1e-1):
         self.kf = cv2.KalmanFilter(4, 2)
-
-        # 状态转移矩阵 (假设匀速模型)
-        self.kf.transitionMatrix = np.array([
-            [1, 0, 1, 0],
-            [0, 1, 0, 1],
-            [0, 0, 1, 0],
-            [0, 0, 0, 1]], dtype=np.float32)
-
-        # 测量矩阵
         self.kf.measurementMatrix = np.array([
             [1, 0, 0, 0],
             [0, 1, 0, 0]], dtype=np.float32)
-
-        # 过程噪声协方差
-        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * process_noise
-
-        # 测量噪声协方差
-        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * measurement_noise
-
-        # 后验误差协方差
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * float(process_noise)
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * float(measurement_noise)
         self.kf.errorCovPost = np.eye(4, dtype=np.float32)
-
+        self.kf.statePost = np.array([[0], [0], [0], [0]], dtype=np.float32)
         self.last_measurement = None
         self.last_update_time = time.time()
 
     def update(self, measurement):
         current_time = time.time()
-        dt = current_time - self.last_update_time
+        dt = max(current_time - self.last_update_time, 1e-3)
         self.last_update_time = current_time
 
-        # 更新状态转移矩阵的时间参数
-        self.kf.transitionMatrix[0, 2] = dt
-        self.kf.transitionMatrix[1, 3] = dt
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]], dtype=np.float32)
 
-        # 预测
-        prediction = self.kf.predict()
+        if self.last_measurement is not None:
+            dx = float(measurement[0]) - float(self.last_measurement[0])
+            dy = float(measurement[1]) - float(self.last_measurement[1])
+            self.kf.processNoiseCov[2, 2] = min(0.5, 0.1 + abs(dx) / 10)
+            self.kf.processNoiseCov[3, 3] = min(0.5, 0.1 + abs(dy) / 10)
 
-        # 更新
-        measurement = np.array([[np.float32(measurement[0])],
-                                [np.float32(measurement[1])]])
-        self.kf.correct(measurement)
-
-        self.last_measurement = measurement
+        self.kf.predict()
+        z = np.array([[np.float32(measurement[0])], [np.float32(measurement[1])]])
+        self.kf.correct(z)
+        self.last_measurement = (float(measurement[0]), float(measurement[1]))
 
     def get_estimate(self):
         if self.last_measurement is None:
             return None
-        state = self.kf.statePost
-        return (state[0, 0], state[1, 0])
-
-
-class EnhancedKalmanFilter(KalmanFilter):
-    def __init__(self,
-                 process_noise=float(config['kalman']['process_noise']),
-                 measurement_noise=float(config['kalman']['measurement_noise'])):
-        super().__init__(process_noise, measurement_noise)
-        # 初始速度估计为0
-        self.kf.statePost = np.array([[0], [0], [0], [0]], dtype=np.float32)
-
-    def update(self, measurement):
-        # 首帧特殊处理
-        if self.last_measurement is None:
-            dx = dy = 0
-        else:
-            dx = measurement[0] - self.last_measurement[0]
-            dy = measurement[1] - self.last_measurement[1]
-            dt = time.time() - self.last_update_time
-            # 动态调整过程噪声
-            dx_val = dx.item() if isinstance(dx, np.ndarray) else dx
-            dy_val = dy.item() if isinstance(dy, np.ndarray) else dy
-            self.kf.processNoiseCov[2, 2] = min(0.5, 0.1 + abs(dx_val) / 10)
-            self.kf.processNoiseCov[3, 3] = min(0.5, 0.1 + abs(dy_val) / 10)
-
-        super().update(measurement)
-
-
-class KalmanFilterWrapper:
-    def __init__(self, max_inactive_time=2.0):
-        self.max_inactive_time = max_inactive_time
-        self.filters = {}  # 存储不同机器人的卡尔曼滤波器
-        self.last_update = {}  # 存储每个机器人的最后更新时间
-
-    def add_data(self, name, x, y, threshold=100000.0):
-        if name not in self.filters:
-            self.filters[name] = EnhancedKalmanFilter()
-            self.last_update[name] = time.time()
-
-        current_filter = self.filters[name]
-
-        # 异常值检测
-        if current_filter.last_measurement is not None:
-            dx = x - current_filter.last_measurement[0, 0]
-            dy = y - current_filter.last_measurement[1, 0]
-            distance = np.sqrt(dx ** 2 + dy ** 2)
-
-            if distance > threshold:
-                return
-
-        current_filter.update((x, y))
-        self.last_update[name] = time.time()
-        guess_list[name] = False
-
-    def filter_data(self, name):
-        if name not in self.filters:
-            return None
-
-        return self.filters[name].get_estimate()
-
-    def get_all_data(self):
-        filtered_d = {}
-        current_time = time.time()
-
-        to_remove = []
-        for name in list(self.filters.keys()):
-            if current_time - self.last_update[name] > self.max_inactive_time:
-                to_remove.append(name)
-                guess_list[name] = True
-            else:
-                estimate = self.filter_data(name)
-                if estimate is not None:
-                    filtered_d[name] = estimate
-                guess_list[name] = False
-
-        # 清理超时的滤波器
-        for name in to_remove:
-            del self.filters[name]
-            del self.last_update[name]
-
-        return filtered_d
+        s = self.kf.statePost
+        return float(s[0, 0]), float(s[1, 0])
 
 
 # 添加滑动窗口滤波器
 class SlidingWindowFilter:
-    def __init__(self, window_size=5, max_inactive_time=2.0, threshold=100000.0):
+    def __init__(self, window_size=5, max_inactive_time=2.0, threshold=100000.0, update_guess=True):
         self.window_size = window_size
         self.max_inactive_time = max_inactive_time
         self.threshold = threshold
+        self.update_guess = update_guess
         self.windows = {}
         self.last_update = {}
 
@@ -340,7 +255,8 @@ class SlidingWindowFilter:
         for name in self.windows:
             if current_time - self.last_update.get(name, 0) > self.max_inactive_time:
                 to_remove.append(name)
-                guess_list[name] = True
+                if self.update_guess:
+                    guess_list[name] = True
 
         for name in to_remove:
             del self.windows[name]
@@ -352,27 +268,137 @@ class SlidingWindowFilter:
                 x_avg = sum(p[0] for p in window) / len(window)
                 y_avg = sum(p[1] for p in window) / len(window)
                 filtered[name] = (x_avg, y_avg)
-                guess_list[name] = False
+                if self.update_guess:
+                    guess_list[name] = False
 
         return filtered
 
 
-# 滤波器选择
-def create_filter(config):
-    filter_type = config['filter']['type']
+class HybridGatedKalmanFilter:
+    def __init__(self,
+                 prefilter_window=3,
+                 prefilter_mode='median',
+                 max_inactive_time=2.0,
+                 raw_jump_threshold=120.0,
+                 pred_jump_threshold=100.0,
+                 process_noise=1e-5,
+                 measurement_noise=1e-1,
+                 update_guess=True):
+        self.prefilter_window = max(1, int(prefilter_window))
+        self.prefilter_mode = prefilter_mode
+        self.max_inactive_time = float(max_inactive_time)
+        self.raw_jump_threshold = float(raw_jump_threshold)
+        self.pred_jump_threshold = float(pred_jump_threshold)
+        self.update_guess = update_guess
 
-    if filter_type == "kalman":
-        return KalmanFilterWrapper(
-            max_inactive_time=float(config['filter']['kalman']['max_inactive_time'])
-        )
-    elif filter_type == "sliding_window":
+        self.raw_windows = {}
+        self.kf_filters = {}
+        self.last_update = {}
+        self.last_raw = {}
+        self.process_noise = float(process_noise)
+        self.measurement_noise = float(measurement_noise)
+
+    def _ensure_target(self, name):
+        if name not in self.raw_windows:
+            self.raw_windows[name] = deque(maxlen=self.prefilter_window)
+        if name not in self.kf_filters:
+            self.kf_filters[name] = MotionKalman2D(
+                process_noise=self.process_noise,
+                measurement_noise=self.measurement_noise
+            )
+
+    def _prefilter_point(self, points):
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        if self.prefilter_mode == 'mean':
+            return float(sum(xs) / len(xs)), float(sum(ys) / len(ys))
+        return float(np.median(xs)), float(np.median(ys))
+
+    def add_data(self, name, x, y):
+        now = time.time()
+        self._ensure_target(name)
+
+        # 原始观测门控：抑制明显跳点
+        if name in self.last_raw:
+            dx = x - self.last_raw[name][0]
+            dy = y - self.last_raw[name][1]
+            if dx * dx + dy * dy > self.raw_jump_threshold * self.raw_jump_threshold:
+                return
+
+        self.raw_windows[name].append((x, y))
+        self.last_raw[name] = (x, y)
+        fx, fy = self._prefilter_point(self.raw_windows[name])
+
+        # 卡尔曼预测门控：观测偏离预测过大则丢弃该观测
+        kf_obj = self.kf_filters[name]
+        if kf_obj.last_measurement is not None:
+            pred = kf_obj.get_estimate()
+            if pred is not None:
+                pdx = fx - pred[0]
+                pdy = fy - pred[1]
+                if pdx * pdx + pdy * pdy > self.pred_jump_threshold * self.pred_jump_threshold:
+                    return
+
+        kf_obj.update((fx, fy))
+        self.last_update[name] = now
+        if self.update_guess:
+            guess_list[name] = False
+
+    def get_all_data(self):
+        current_time = time.time()
+        filtered = {}
+        to_remove = []
+
+        for name in list(self.kf_filters.keys()):
+            if current_time - self.last_update.get(name, 0) > self.max_inactive_time:
+                to_remove.append(name)
+                if self.update_guess:
+                    guess_list[name] = True
+                continue
+
+            estimate = self.kf_filters[name].get_estimate()
+            if estimate is not None:
+                filtered[name] = estimate
+            if self.update_guess:
+                guess_list[name] = False
+
+        for name in to_remove:
+            self.raw_windows.pop(name, None)
+            self.kf_filters.pop(name, None)
+            self.last_update.pop(name, None)
+            self.last_raw.pop(name, None)
+
+        return filtered
+
+
+def create_filter_by_type(config, filter_type, update_guess=True):
+    if filter_type == "hybrid":
+        filter_type = "hybrid_gated_kalman"
+    if filter_type == "sliding_window":
         return SlidingWindowFilter(
             window_size=int(config['filter']['sliding_window']['window_size']),
             max_inactive_time=float(config['filter']['sliding_window']['max_inactive_time']),
-            threshold=float(config['filter']['sliding_window']['threshold'])
+            threshold=float(config['filter']['sliding_window']['threshold']),
+            update_guess=update_guess
         )
-    else:
-        raise ValueError(f"Unsupported filter type: {filter_type}")
+    if filter_type == "hybrid_gated_kalman":
+        hybrid_cfg = config.get('filter', {}).get('hybrid_gated_kalman', {})
+        return HybridGatedKalmanFilter(
+            prefilter_window=int(hybrid_cfg.get('prefilter_window', 3)),
+            prefilter_mode=str(hybrid_cfg.get('prefilter_mode', 'median')),
+            max_inactive_time=float(hybrid_cfg.get('max_inactive_time', 2.0)),
+            raw_jump_threshold=float(hybrid_cfg.get('raw_jump_threshold', 120.0)),
+            pred_jump_threshold=float(hybrid_cfg.get('pred_jump_threshold', 100.0)),
+            process_noise=float(hybrid_cfg.get('process_noise', 1e-5)),
+            measurement_noise=float(hybrid_cfg.get('measurement_noise', 1e-1)),
+            update_guess=update_guess
+        )
+    raise ValueError(f"Unsupported filter type: {filter_type}")
+
+
+# 滤波器选择
+def create_filter(config):
+    return create_filter_by_type(config, config['filter']['type'], update_guess=True)
 
 
 # 海康相机图像获取线程
@@ -1159,6 +1185,21 @@ def ser_receive():
 filter = create_filter(config)
 print(f"已启用滤波器类型: {config['filter']['type']}")
 
+compare_filter = None
+if compare_enabled:
+    main_type = config['filter']['type']
+    if compare_type == 'auto':
+        compare_type = 'hybrid_gated_kalman' if main_type == 'sliding_window' else 'sliding_window'
+    if compare_type == main_type:
+        print(f"对比滤波器与主滤波器相同({main_type})，已自动关闭对比")
+    else:
+        try:
+            compare_filter = create_filter_by_type(config, compare_type, update_guess=False)
+            print(f"已启用影子对比滤波器: {compare_type}")
+        except Exception as e:
+            compare_filter = None
+            print(f"影子对比滤波器创建失败: {e}")
+
 # 加载模型，实例化机器人检测器和装甲板检测器 yolov5
 weights_path = config['paths']['models']['car']
 weights_path_next = config['paths']['models']['armor']
@@ -1363,11 +1404,14 @@ while True:
                     else:
                         # 卡尔曼滤波直接更新
                         filter.add_data(best_cls, X_M, Y_M)
+                    if compare_filter is not None:
+                        compare_filter.add_data(best_cls, X_M, Y_M)
         del roi_list
         del roi_pos
 
     # 获取所有识别到的机器人坐标
     all_filter_data = filter.get_all_data()
+    compare_filter_data = compare_filter.get_all_data() if compare_filter is not None else {}
     # print(all_filter_data_name)
     if all_filter_data != {}:
         for name, xyxy in all_filter_data.items():
@@ -1393,6 +1437,31 @@ while True:
                                 (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
 
+    compare_map = map_backup.copy() if compare_filter is not None and compare_draw else None
+    if compare_filter is not None and compare_draw and compare_filter_data:
+        for name, xyxy in compare_filter_data.items():
+            if xyxy is None:
+                continue
+            if name[0] != state:
+                if state == 'R':
+                    cmp_xyz = (2800 - xyxy[1], xyxy[0])
+                else:
+                    cmp_xyz = (xyxy[1], 1500 - xyxy[0])
+                cmp_point = (int(cmp_xyz[0]), int(cmp_xyz[1]))
+                cv2.circle(compare_map, cmp_point, 15, (0, 255, 255), -1)
+                cv2.putText(compare_map, str(name), (cmp_point[0] - 5, cmp_point[1] + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+
+                if compare_text and name in all_filter_data and all_filter_data[name] is not None:
+                    main_xy = all_filter_data[name]
+                    if state == 'R':
+                        main_xyz = (2800 - main_xy[1], main_xy[0])
+                    else:
+                        main_xyz = (main_xy[1], 1500 - main_xy[0])
+                    delta = np.sqrt((main_xyz[0] - cmp_xyz[0]) ** 2 + (main_xyz[1] - cmp_xyz[1]) ** 2)
+                    cv2.putText(compare_map, f"d={delta:.1f}", (cmp_point[0] + 12, cmp_point[1] + 20),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+
     te = time.time()
     t_p = te - ts
     print("fps:", 1 / t_p)  # 打印帧率
@@ -1406,7 +1475,14 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.imshow('information_ui', information_ui_show)
     map_show = cv2.resize(map, tuple(config['ui']['map_display_size']))
-    cv2.imshow('map', map_show)
+    cv2.putText(map_show, "Main Filter", (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    cv2.imshow('map_main', map_show)
+    if compare_map is not None:
+        map_compare_show = cv2.resize(compare_map, tuple(config['ui']['map_display_size']))
+        cv2.putText(map_compare_show, f"Compare Filter: {compare_type}", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+        cv2.imshow('map_compare', map_compare_show)
     img0 = cv2.resize(img0, tuple(config['ui']['img_display_size']))
     cv2.imshow('img', img0)
     if save_img:
