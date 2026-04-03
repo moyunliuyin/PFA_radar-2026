@@ -93,6 +93,7 @@ encryption_level = 1  # 己方加密等级（对方干扰波难度），开局�
 key_modifiable = -1  # 密钥是否可修改
 chances_flag = 0  # radar_cmd当前值，开局为0，每小局重置需重启程序，触发后循环递0→1→2→0→...
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
+mark_progress_bit_cache = {i: -1 for i in range(6)}
 
 # 密钥相关全局变量
 current_password = generate_random_password()  # 开局生成随机密钥
@@ -102,6 +103,10 @@ last_encryption_level = 1  # 上一次的加密等级，用于检测等级变化
 # 双倍易伤触发策略配置
 trigger_mode = config['double_vulnerability']['trigger_mode']  # 'distance', 'motion', 'both'
 print(f"双倍易伤触发模式: {trigger_mode}")
+
+# 盲区预测配置
+blind_zone_enabled = bool(config.get('blind_zone', {}).get('enabled', True))
+blind_zone_roles = {'1', '2', '7'}
 
 # 距离触发相关
 if trigger_mode in ['distance', 'both']:
@@ -920,86 +925,42 @@ def ser_send():
         try:
             all_filter_data = filter.get_all_data()
             if state == 'R':
-                if not guess_list.get('B1'):
-                    if all_filter_data.get('B1', False):
-                        send_map['B1'] = send_point_B('B1', all_filter_data)
-                else:
-                    send_map['B1'] = (0, 0)
+                opponent_prefix = 'B'
+                ally_prefix = 'R'
+            else:
+                opponent_prefix = 'R'
+                ally_prefix = 'B'
 
-                if not guess_list.get('B2'):
-                    if all_filter_data.get('B2', False):
-                        send_map['B2'] = send_point_B('B2', all_filter_data)
-                else:
-                    send_map['B2'] = (0, 0)
+            def update_send_map_entry(robot_name, allow_guess=False):
+                # 仅敌方哨兵保留盲区预测，其他机器人无识别时统一置0
+                if allow_guess and guess_list.get(robot_name):
+                    send_map[robot_name] = send_point_guess(robot_name, guess_time_limit)
+                    return
 
-                # 步兵3号
-                if not guess_list.get('B3'):
-                    if all_filter_data.get('B3', False):
-                        send_map['B3'] = send_point_B('B3', all_filter_data)
-                else:
-                    send_map['B3'] = (0, 0)
+                if guess_list.get(robot_name):
+                    send_map[robot_name] = (0, 0)
+                    return
 
-                # 步兵4号
-                if not guess_list.get('B4'):
-                    if all_filter_data.get('B4', False):
-                        send_map['B4'] = send_point_B('B4', all_filter_data)
+                if all_filter_data.get(robot_name, False):
+                    if robot_name[0] == 'B':
+                        send_map[robot_name] = send_point_B(robot_name, all_filter_data)
+                    else:
+                        send_map[robot_name] = send_point_R(robot_name, all_filter_data)
                 else:
-                    send_map['B4'] = (0, 0)
+                    send_map[robot_name] = (0, 0)
 
-                if not guess_list.get('B5'):
-                    if all_filter_data.get('B5', False):
-                        send_map['B5'] = send_point_B('B5', all_filter_data)
-                else:
-                    send_map['B5'] = (0, 0)
-
-                # 哨兵
-                if guess_list.get('B7'):
-                    send_map['B7'] = send_point_guess('B7', guess_time_limit)
-                # 未识别到哨兵，进行盲区预测
-                else:
-                    if all_filter_data.get('B7', False):
-                        send_map['B7'] = send_point_B('B7', all_filter_data)
-
-            if state == 'B':
-                if not guess_list.get('R1'):
-                    if all_filter_data.get('R1', False):
-                        send_map['R1'] = send_point_R('R1', all_filter_data)
-                else:
-                    send_map['R1'] = (0, 0)
-
-                if not guess_list.get('R2'):
-                    if all_filter_data.get('R2', False):
-                        send_map['R2'] = send_point_R('R2', all_filter_data)
-                else:
-                    send_map['R2'] = (0, 0)
-
-                # 步兵3号
-                if not guess_list.get('R3'):
-                    if all_filter_data.get('R3', False):
-                        send_map['R3'] = send_point_R('R3', all_filter_data)
-                else:
-                    send_map['R3'] = (0, 0)
-
-                # 步兵4号
-                if not guess_list.get('R4'):
-                    if all_filter_data.get('R4', False):
-                        send_map['R4'] = send_point_R('R4', all_filter_data)
-                else:
-                    send_map['R4'] = (0, 0)
-
-                if not guess_list.get('R5'):
-                    if all_filter_data.get('R5', False):
-                        send_map['R5'] = send_point_R('R5', all_filter_data)
-                else:
-                    send_map['R5'] = (0, 0)
-
-                # 哨兵
-                if guess_list.get('R7'):
-                    send_map['R7'] = send_point_guess('R7', guess_time_limit)
-                # 未识别到哨兵，进行盲区预测
-                else:
-                    if all_filter_data.get('R7', False):
-                        send_map['R7'] = send_point_R('R7', all_filter_data)
+            for role in ['1', '2', '3', '4', '5', '6', '7']:
+                enemy_name = f"{opponent_prefix}{role}"
+                ally_name = f"{ally_prefix}{role}"
+                update_send_map_entry(
+                    enemy_name,
+                    allow_guess=(
+                        blind_zone_enabled
+                        and role in blind_zone_roles
+                        and enemy_name in guess_table
+                    )
+                )
+                update_send_map_entry(ally_name, allow_guess=False)
 
             ser_data = build_data_radar_all(send_map, state)
             packet, seq = build_send_packet(ser_data, seq, [0x03, 0x05])
@@ -1113,6 +1074,7 @@ def ser_receive():
     global encryption_level  # 己方加密等级
     global key_modifiable  # 密钥是否可修改
     global target  # 飞镖当前目标
+    global mark_progress_bit_cache  # 0x020C 
     progress_cmd_id = [0x02, 0x0C]  # 任意想要接收数据的命令码，这里是雷达标记进度的命令码0x020C
     vulnerability_cmd_id = [0x02, 0x0E]  # 双倍易伤次数和触发状态
     target_cmd_id = [0x01, 0x05]  # 飞镖目标
@@ -1153,6 +1115,9 @@ def ser_receive():
                     received_cmd_id1, received_data1, received_seq1 = progress_result
                     mark_progress = struct.unpack('H', received_data1[:2])[0]
                     vulnerability = [((mark_progress >> i) & 0x01) * 120 for i in range(6)]
+                    for bit_idx in range(6):
+                        mark_progress_bit_cache[bit_idx] = vulnerability[bit_idx]
+
                     if state == 'R':
                         guess_value_now['B1'] = vulnerability[0]
                         guess_value_now['B2'] = vulnerability[1]

@@ -105,45 +105,27 @@ def build_data_radar(target_robot_id, target_position_x, target_position_y):
 
 
 # 雷达数据部分构建示例
-def build_data_radar_all(send_map,state):
+def build_data_radar_all(send_map, state):
+    """
+    构建 0x0305 的 map_robot_data_t 数据段（共24个uint16_t，48字节）：
+    1) 对方: hero/engineer/infantry3/infantry4/aerial/sentry 的 x,y
+    2) 己方: hero/engineer/infantry3/infantry4/aerial/sentry 的 x,y
+    """
+    data = bytearray()
+
+    # 角色顺序按协议: 1,2,3,4,6,7 (hero/engineer/inf3/inf4/aerial/sentry)
+    role_order = ['1', '2', '3', '4', '6', '7']
     if state == 'R':
-        data = bytearray()
-        data.extend(bytearray(struct.pack('H', int(send_map['B1'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B1'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B2'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B2'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B3'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B3'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B4'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B4'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B5'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B5'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['B7'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['B7'][1]))))  # y坐标 (小端)
+        opponent_prefix, ally_prefix = 'B', 'R'
     else:
-        data = bytearray()
-        data.extend(bytearray(struct.pack('H', int(send_map['R1'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R1'][1]))))  # y坐标 (小端)
+        opponent_prefix, ally_prefix = 'R', 'B'
 
-        data.extend(bytearray(struct.pack('H', int(send_map['R2'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R2'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R3'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R3'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R4'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R4'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R5'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R5'][1]))))  # y坐标 (小端)
-
-        data.extend(bytearray(struct.pack('H', int(send_map['R7'][0]))))  # x坐标 (小端)
-        data.extend(bytearray(struct.pack('H', int(send_map['R7'][1]))))  # y坐标 (小端)
+    for prefix in (opponent_prefix, ally_prefix):
+        for role in role_order:
+            key = f"{prefix}{role}"
+            x, y = send_map.get(key, (0, 0))
+            data.extend(bytearray(struct.pack('H', int(x))))
+            data.extend(bytearray(struct.pack('H', int(y))))
 
     return data
 

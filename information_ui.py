@@ -3,24 +3,14 @@ import time
 import cv2
 import numpy as np
 
-index_table = {
-    1: "R1",
-    2: "R2",
-    3: "R3",
-    4: "R4",
-    5: "R7",
-    101: "B1",
-    102: "B2",
-    103: "B3",
-    104: "B4",
-    105: "B7"
-}
-
 
 # 绘制裁判系统数据的UI
 def draw_information_ui(bar_list, camp, image):
     cv2.line(image, (300, 0), (300, 300), (0, 150, 0), 2)
     height_light = [0, 0, 0, 0, 0, 0]
+    # bit0-5 固定对应 1/2/3/4/6/7 号
+    robot_no_map = [1, 2, 3, 4, 6, 7]
+    enemy_prefix = 'B' if camp == 'R' else 'R'
 
     # 计算每条线段的长度
     num_lines = len(bar_list)
@@ -33,8 +23,9 @@ def draw_information_ui(bar_list, camp, image):
     for i, value in enumerate(bar_list):
 
         # 计算线段长度
+        value_clamped = max(0, value)
         if value > threshold:
-            line_length = int((value / max_value) * max_length)
+            line_length = int((value_clamped / max_value) * max_length)
             line_height = 8
             height_light[i] = 1
             if camp == 'R':
@@ -47,19 +38,19 @@ def draw_information_ui(bar_list, camp, image):
                 color = (200, 0, 0)  # 超过临界值的线段高光处理为绿色
             else:
                 color = (0, 0, 200)
-            line_length = int((value / max_value) * max_length)
+            line_length = int((value_clamped / max_value) * max_length)
 
         # 绘制线段
         start_point = (50, i * segment_height + segment_height // 2)
         end_point = (50 + line_length, i * segment_height + segment_height // 2)
         cv2.line(image, start_point, end_point, color, line_height, lineType=cv2.LINE_AA)
 
-        # 绘制索引
-        if camp == 'R':
-            index = i + 101
+        # 绘制索引（与bit位一一对应）
+        if i < len(robot_no_map):
+            robot_name = f"{enemy_prefix}{robot_no_map[i]}"
         else:
-            index = i + 1
-        cv2.putText(image, str(index_table.get(index)), (10, start_point[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+            robot_name = f"{enemy_prefix}?"
+        cv2.putText(image, robot_name, (10, start_point[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                     (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(image, str(value), (370, start_point[1] + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2,
                     cv2.LINE_AA)
