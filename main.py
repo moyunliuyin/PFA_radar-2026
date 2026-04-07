@@ -628,8 +628,11 @@ def ser_send():
     # 发送蓝方机器人坐标
     def send_point_B(send_name, all_filter_data):
         # front_time = time.time()
-        # 转换为地图坐标系
-        filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        # 同一帧内所有机器人使用统一坐标系（由当前己方阵营state决定）
+        if state == 'R':
+            filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        else:
+            filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
         ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
@@ -647,8 +650,11 @@ def ser_send():
     # 发送红方机器人坐标
     def send_point_R(send_name, all_filter_data):
         # front_time = time.time()
-        # 转换为地图坐标系
-        filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
+        # 同一帧内所有机器人使用统一坐标系（由当前己方阵营state决定）
+        if state == 'R':
+            filtered_xyz = (2800 - all_filter_data[send_name][1], all_filter_data[send_name][0])
+        else:
+            filtered_xyz = (all_filter_data[send_name][1], 1500 - all_filter_data[send_name][0])
         # 转换为裁判系统单位CM
         ser_x = int(filtered_xyz[0]) * 10 / 10
         ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
@@ -1375,6 +1381,16 @@ while True:
         del roi_pos
 
     # 获取所有识别到的机器人坐标
+    def project_to_map_and_serial(robot_name, xy):
+        """按当前阵营state统一换算坐标，避免同帧出现两套坐标系。"""
+        if state == 'R':
+            map_xy = (2800 - xy[1], xy[0])
+        else:
+            map_xy = (xy[1], 1500 - xy[0])
+        ser_x = int(map_xy[0]) * 10 / 10
+        ser_y = int(1500 - map_xy[1]) * 10 / 10
+        return map_xy, (ser_x, ser_y)
+
     all_filter_data = filter.get_all_data()
     compare_filter_data = compare_filter.get_all_data() if compare_filter is not None else {}
     # print(all_filter_data_name)
@@ -1386,46 +1402,39 @@ while True:
                     color_m = (0, 0, 255)
                 else:
                     color_m = (255, 0, 0)
-                if state == 'R':
-                    filtered_xyz = (2800 - xyxy[1], xyxy[0])  # 缩放坐标到地图图像
-                else:
-                    filtered_xyz = (xyxy[1], 1500 - xyxy[0])  # 缩放坐标到地图图像
-                # 只绘制敌方阵营的机器人（这里不会绘制盲区预测的机器人）
-                if name[0] != state:
-                    cv2.circle(map, (int(filtered_xyz[0]), int(filtered_xyz[1])), 15, color_m, -1)  # 绘制圆
-                    cv2.putText(map, str(name),
-                                (int(filtered_xyz[0]) - 5, int(filtered_xyz[1]) + 5),
-                                cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
-                    ser_x = int(filtered_xyz[0]) * 10 / 10
-                    ser_y = int(1500 - filtered_xyz[1]) * 10 / 10
-                    cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
-                                (int(filtered_xyz[0]) - 100, int(filtered_xyz[1]) + 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
+                filtered_xyz, (ser_x, ser_y) = project_to_map_and_serial(name, xyxy)
+                point = (int(filtered_xyz[0]), int(filtered_xyz[1]))
+
+                # 双方同时绘制：敌方实心圆，己方空心圆，便于快速区分。
+                thickness = -1 if name[0] != state else 3
+                cv2.circle(map, point, 15, color_m, thickness)
+                cv2.putText(map, str(name),
+                            (point[0] - 5, point[1] + 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+                cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
+                            (point[0] - 100, point[1] + 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
 
     compare_map = map_backup.copy() if compare_filter is not None and compare_draw else None
     if compare_filter is not None and compare_draw and compare_filter_data:
         for name, xyxy in compare_filter_data.items():
             if xyxy is None:
                 continue
-            if name[0] != state:
-                if state == 'R':
-                    cmp_xyz = (2800 - xyxy[1], xyxy[0])
-                else:
-                    cmp_xyz = (xyxy[1], 1500 - xyxy[0])
-                cmp_point = (int(cmp_xyz[0]), int(cmp_xyz[1]))
-                cv2.circle(compare_map, cmp_point, 15, (0, 255, 255), -1)
-                cv2.putText(compare_map, str(name), (cmp_point[0] - 5, cmp_point[1] + 5),
-                            cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+            cmp_xyz, (cmp_ser_x, cmp_ser_y) = project_to_map_and_serial(name, xyxy)
+            cmp_point = (int(cmp_xyz[0]), int(cmp_xyz[1]))
+            cmp_thickness = -1 if name[0] != state else 3
+            cv2.circle(compare_map, cmp_point, 15, (0, 255, 255), cmp_thickness)
+            cv2.putText(compare_map, str(name), (cmp_point[0] - 5, cmp_point[1] + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 2.5, (255, 255, 255), 5)
+            cv2.putText(compare_map, f"({cmp_ser_x},{cmp_ser_y})", (cmp_point[0] - 100, cmp_point[1] + 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
 
-                if compare_text and name in all_filter_data and all_filter_data[name] is not None:
-                    main_xy = all_filter_data[name]
-                    if state == 'R':
-                        main_xyz = (2800 - main_xy[1], main_xy[0])
-                    else:
-                        main_xyz = (main_xy[1], 1500 - main_xy[0])
-                    delta = np.sqrt((main_xyz[0] - cmp_xyz[0]) ** 2 + (main_xyz[1] - cmp_xyz[1]) ** 2)
-                    cv2.putText(compare_map, f"d={delta:.1f}", (cmp_point[0] + 12, cmp_point[1] + 20),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+            if compare_text and name in all_filter_data and all_filter_data[name] is not None:
+                main_xy = all_filter_data[name]
+                main_xyz, _ = project_to_map_and_serial(name, main_xy)
+                delta = np.sqrt((main_xyz[0] - cmp_xyz[0]) ** 2 + (main_xyz[1] - cmp_xyz[1]) ** 2)
+                cv2.putText(compare_map, f"d={delta:.1f}", (cmp_point[0] + 12, cmp_point[1] + 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
     te = time.time()
     t_p = te - ts
