@@ -37,10 +37,27 @@ class YOLOv5Detector:
     def __init__(self, weights_path, img_size=(640, 640), conf_thres=0.70, iou_thres=0.2, max_det=10,
                  device='', classes=None, agnostic_nms=False, augment=False, visualize=False, half=True, dnn=False,
                  data='data/coco128.yaml', ui=False):
-        # 设置设备 - 强制使用CPU
+        # 设置设备：默认遵从上层传入，必要时安全回退到CPU
         self.ui = ui
-        self.device = select_device('cpu')  # 强制使用CPU
-        print(f"使用设备: {self.device}")
+        requested_device = str(device).strip().lower() if device is not None else ''
+        if requested_device in ('', 'none'):
+            requested_device = 'cpu'
+
+        # YOLOv5 的 select_device 常用 '0' 指代第一张GPU
+        if requested_device.startswith('cuda'):
+            if ':' in requested_device:
+                requested_device = requested_device.split(':', 1)[1] or '0'
+            else:
+                requested_device = '0'
+        elif requested_device == 'gpu':
+            requested_device = '0'
+
+        # CUDA不可用时回退CPU，避免初始化报错
+        if requested_device != 'cpu' and not torch.cuda.is_available():
+            requested_device = 'cpu'
+
+        self.device = select_device(requested_device)
+        print(f"使用设备: {self.device} (requested={device})")
 
         # 加载模型 - 禁用半精度(CPU不支持FP16)
         self.model = DetectMultiBackend(weights_path, device=self.device, dnn=dnn, fp16=False, data=data)

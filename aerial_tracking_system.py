@@ -541,6 +541,10 @@ class AerialTrackingSystem:
                  camera_cx=None, camera_cy=None,
                  dist_coeffs=None, enable_undistort=True,
                  camera_exposure=55915.0, camera_gain=10.5,
+                 laser_img_size=(640, 640),
+                 laser_conf_thres=0.25,
+                 laser_iou_thres=0.45,
+                 laser_max_det=1,
                  kalman_prediction_time_ms=200.0,
                  kalman_process_noise=1e-3,
                  kalman_measurement_noise=1e-1,
@@ -619,10 +623,10 @@ class AerialTrackingSystem:
         # 使用 best.pt 训练权重 + data2_laser.yaml（单类 laser，class 0）
         self.laser_module_detector = YOLOv5Detector(
             weights_path=laser_module_model_path,
-            img_size=(640, 640),  # 激光模块目标尺寸适中
-            conf_thres=0.25,
-            iou_thres=0.45, 
-            max_det=1,  # 只跟踪单个目标
+            img_size=laser_img_size,
+            conf_thres=laser_conf_thres,
+            iou_thres=laser_iou_thres,
+            max_det=laser_max_det,
             device=self.device_str,
             data=laser_data_yaml,  # 使用 data2_laser.yaml（nc=1, laser class）
             classes=None,  # 检测所有类别（模型只有 laser 一类）
@@ -632,6 +636,7 @@ class AerialTrackingSystem:
         print(f"✓ 模型加载完成")
         print(f"  激光模块检测模型: {laser_module_model_path}")
         print(f"  数据集配置: {laser_data_yaml}")
+        print(f"  检测参数: img_size={laser_img_size}, conf={laser_conf_thres}, iou={laser_iou_thres}, max_det={laser_max_det}")
         
         # 初始化海康相机
         print("初始化海康相机...")
@@ -706,6 +711,11 @@ class AerialTrackingSystem:
         self.pitch_reversal_window_deg = 1.3
         self._last_pitch_err_sign = 0
 
+        # 非检测帧保持重发：不更新控制量，仅重发上一条绝对角命令
+        self.hold_resend_enabled = False
+        self.hold_resend_hz = 60.0
+        self._last_hold_resend_time = 0.0
+
         # 每隔N帧才进行检测和发送，预留云台调整姿态的时间
         self.frame_interval = 3       # 检测间隔（每N帧检测一次），1=每帧都检测
         self.frame_counter = 0        # 帧计数器
@@ -738,10 +748,149 @@ class AerialTrackingSystem:
         self.last_target_pos = None
         self.target_lost_frames = 0
         self.max_lost_frames = 10  # 最大丢失帧数
+        self.max_target_jump_distance = 200.0  # 目标突变判定阈值（像素）
+
+        # 失锁主动扫描状态机（上位机侧，不修改下位机协议）
+        self.scan_enabled = True
+        self.scan_pattern = 'spiral'          # spiral | circle
+        self.scan_enter_lost_frames = 3       # 连续丢失多少检测帧后进入扫描
+        self.scan_reacq_confirm_frames = 2    # 连续检测到多少帧后退出扫描
+        self.scan_radius_deg = 4.0            # circle模式半径（度）
+        self.scan_rate_hz = 0.20              # circle模式转速（Hz）
+        self.scan_spiral_spacing_deg = 1.8    # spiral圈间距（度）
+        self.scan_spiral_speed_deg_s = 10.0   # spiral路径速度（度/秒）
+        self.scan_spiral_r_max_deg = 10.0     # spiral最大半径（度）
+        self.scan_spiral_return = False       # 达到最大半径后是否回扫
+        self.scan_k_roll = 1.4                # 横向扫描尺度
+        self.scan_k_pitch = 1.0               # 纵向扫描尺度
+
+        self.scan_active = False
+        self.scan_reacq_count = 0
+        self.scan_center_pitch = 0.0
+        self.scan_center_roll = 0.0
+        self.scan_phase = 0.0
+        self.scan_theta = 0.0
+        self.scan_dir = 1
+        self._scan_last_time = 0.0
 
         # 云台姿态记录器：维护相对于初始位置的绝对角度
         self.gimbal_pose = GimbalPoseRecorder()
         print("✓ 云台姿态记录器已启用（发送绝对角度）")
+
+    def _start_scan(self):
+        if self.scan_active:
+            return
+        self.scan_active = True
+        self.scan_reacq_count = 0
+        self.scan_center_pitch = float(self.last_sent_pitch)
+        self.scan_center_roll = float(self.last_sent_roll)
+        self.scan_phase = 0.0
+        self.scan_theta = 0.0
+        self.scan_dir = 1
+        self._scan_last_time = time.perf_counter()
+        print(f"[扫描] 启动 pattern={self.scan_pattern}, center=({self.scan_center_pitch:.2f},{self.scan_center_roll:.2f})")
+
+    def _stop_scan(self, reason=""):
+        if self.scan_active:
+            msg = f"[扫描] 退出 reason={reason}" if reason else "[扫描] 退出"
+            print(msg)
+        self.scan_active = False
+        self.scan_reacq_count = 0
+        self.scan_phase = 0.0
+        self.scan_theta = 0.0
+        self.scan_dir = 1
+
+    def _update_scan_target(self, dt):
+        dt = float(max(1e-3, min(0.10, dt)))
+        pattern = str(self.scan_pattern).lower()
+
+        if pattern == 'spiral':
+            spacing = max(0.2, float(self.scan_spiral_spacing_deg))
+            a = spacing / (2.0 * np.pi)
+            theta = float(self.scan_theta)
+            r = a * theta
+            r_max = max(spacing, float(self.scan_spiral_r_max_deg))
+            k_roll = max(0.2, float(self.scan_k_roll))
+            k_pitch = max(0.2, float(self.scan_k_pitch))
+
+            if self.scan_spiral_return:
+                if self.scan_dir > 0 and r >= r_max:
+                    self.scan_dir = -1
+                elif self.scan_dir < 0 and theta <= 0.0:
+                    self.scan_dir = 1
+                    theta = 0.0
+                    r = 0.0
+
+            if r < r_max:
+                dx_dtheta = k_roll * (a * np.cos(theta) - r * np.sin(theta))
+                dy_dtheta = k_pitch * (a * np.sin(theta) + r * np.cos(theta))
+            else:
+                r = r_max
+                dx_dtheta = -k_roll * r * np.sin(theta)
+                dy_dtheta = k_pitch * r * np.cos(theta)
+
+            ds_dtheta = max(1e-3, float(np.hypot(dx_dtheta, dy_dtheta)))
+            speed = max(0.5, float(self.scan_spiral_speed_deg_s))
+            step = (speed / ds_dtheta) * dt
+
+            if self.scan_spiral_return:
+                theta += float(self.scan_dir) * step
+                if theta < 0.0:
+                    theta = 0.0
+            else:
+                theta += step
+
+            if theta > 1000.0 * np.pi:
+                theta = float(np.fmod(theta, 2.0 * np.pi))
+
+            self.scan_theta = theta
+            r_eval = min(a * theta, r_max)
+            target_pitch = self.scan_center_pitch + k_pitch * r_eval * np.sin(theta)
+            target_roll = self.scan_center_roll + k_roll * r_eval * np.cos(theta)
+            return float(target_pitch), float(target_roll)
+
+        self.scan_phase += 2.0 * np.pi * max(0.01, float(self.scan_rate_hz)) * dt
+        if self.scan_phase > 2.0 * np.pi:
+            self.scan_phase = float(np.fmod(self.scan_phase, 2.0 * np.pi))
+        target_pitch = self.scan_center_pitch + float(self.scan_radius_deg) * float(self.scan_k_pitch) * np.sin(self.scan_phase)
+        target_roll = self.scan_center_roll + float(self.scan_radius_deg) * float(self.scan_k_roll) * np.cos(self.scan_phase)
+        return float(target_pitch), float(target_roll)
+
+    def _send_absolute_command(self, target_pitch, target_roll, zero_velocity=True, tag="ABS"):
+        pitch_cmd = float(target_pitch)
+        roll_cmd = float(target_roll)
+
+        # 与常规控制一致：限步 + 一阶平滑
+        if self.max_step_deg_pitch is not None and self.max_step_deg_pitch > 0:
+            dp = pitch_cmd - self.last_sent_pitch
+            dp = max(-self.max_step_deg_pitch, min(self.max_step_deg_pitch, dp))
+            pitch_cmd = self.last_sent_pitch + dp
+        if self.max_step_deg_roll is not None and self.max_step_deg_roll > 0:
+            dr = roll_cmd - self.last_sent_roll
+            dr = max(-self.max_step_deg_roll, min(self.max_step_deg_roll, dr))
+            roll_cmd = self.last_sent_roll + dr
+
+        pitch_cmd = self.last_sent_pitch + self.command_smooth_pitch * (pitch_cmd - self.last_sent_pitch)
+        roll_cmd = self.last_sent_roll + self.command_smooth_roll * (roll_cmd - self.last_sent_roll)
+
+        send_pitch = round(float(pitch_cmd), 2)
+        send_roll = round(float(roll_cmd), 2)
+        v_pitch = 0.0
+        v_roll = 0.0
+        if not zero_velocity and self.enable_velocity_feedforward:
+            v_pitch, v_roll = self.angle_filter.get_velocity()
+
+        self.last_sent_pitch = send_pitch
+        self.last_sent_roll = send_roll
+        self.gimbal_pose.set_pose(self.last_sent_pitch, self.last_sent_roll)
+
+        try:
+            if self.enable_velocity_feedforward:
+                self.serial.send_pitch_yaw_velocity(send_pitch, send_roll, v_pitch, v_roll)
+            else:
+                self.serial.send_pitch_yaw(send_pitch, send_roll)
+        except Exception as e:
+            print(f"[{tag}] 命令发送异常: {e}")
         
     def detect_laser_module(self, frame):
         """检测激光检测模块
@@ -1164,6 +1313,12 @@ class AerialTrackingSystem:
         
         try:
             while True:
+                loop_now = time.perf_counter()
+                if not hasattr(self, '_last_loop_perf'):
+                    self._last_loop_perf = loop_now
+                loop_dt = loop_now - self._last_loop_perf
+                self._last_loop_perf = loop_now
+
                 # 读取图像
                 ret, frame = self.camera.read()
                 if not ret:
@@ -1194,6 +1349,19 @@ class AerialTrackingSystem:
                     self.last_detection_result = laser_module  # 缓存结果
                 else:
                     laser_module = self.last_detection_result  # 使用缓存结果（仅用于显示）
+
+                skip_tracking_update = False
+                if should_detect:
+                    if laser_module is not None:
+                        if self.scan_active:
+                            self.scan_reacq_count += 1
+                            need = max(1, int(self.scan_reacq_confirm_frames))
+                            if self.scan_reacq_count >= need:
+                                self._stop_scan("reacquired")
+                            else:
+                                skip_tracking_update = True
+                    else:
+                        self.scan_reacq_count = 0
                 
                 if laser_module:
                     # 只在检测帧统计成功次数
@@ -1204,14 +1372,14 @@ class AerialTrackingSystem:
                     center = laser_module['center']
                     
                     # 只在检测帧进行跟踪更新和发送
-                    if should_detect:
+                    if should_detect and not skip_tracking_update:
                         # 更新目标跟踪
                         if self.last_target_pos is not None:
                             # 计算与上一帧的距离
                             dist = np.sqrt((center[0] - self.last_target_pos[0])**2 + 
                                           (center[1] - self.last_target_pos[1])**2)
                             # 如果距离太大，可能是新目标，重置滤波器
-                            if dist > 200:
+                            if dist > self.max_target_jump_distance:
                                 self.target_id += 1
                                 self.angle_filter.reset()
                                 self.track_initialized = False
@@ -1269,6 +1437,23 @@ class AerialTrackingSystem:
                             'aim_x': aim_x,
                             'aim_y': aim_y
                         }
+                    elif should_detect and skip_tracking_update:
+                        # 扫描期间的重获确认阶段：保持扫描控制，暂不切回常规闭环
+                        if hasattr(self, '_display_data'):
+                            pitch_deg_filtered = self._display_data['pitch_deg_filtered']
+                            pitch_deg_raw = self._display_data['pitch_deg_raw']
+                            roll_deg_filtered = self._display_data['roll_deg_filtered']
+                            roll_deg_raw = self._display_data['roll_deg_raw']
+                            pixel_offset_x = self._display_data['pixel_offset_x']
+                            pixel_offset_y = self._display_data['pixel_offset_y']
+                            aim_x = self._display_data.get('aim_x', float(self.frame_center[0]))
+                            aim_y = self._display_data.get('aim_y', float(self.frame_center[1]))
+                        else:
+                            pitch_deg_filtered = pitch_deg_raw = 0
+                            roll_deg_filtered = roll_deg_raw = 0
+                            pixel_offset_x = pixel_offset_y = 0
+                            aim_x = float(self.frame_center[0])
+                            aim_y = float(self.frame_center[1])
                     else:
                         # 非检测帧：使用缓存的显示数据
                         if hasattr(self, '_display_data'):
@@ -1280,6 +1465,28 @@ class AerialTrackingSystem:
                             pixel_offset_y = self._display_data['pixel_offset_y']
                             aim_x = self._display_data.get('aim_x', float(self.frame_center[0]))
                             aim_y = self._display_data.get('aim_y', float(self.frame_center[1]))
+
+                            # 检测间隔开启时，在非检测帧重发上一条命令，避免发送频率过低
+                            if self.hold_resend_enabled and not self.scan_active:
+                                now_hold = time.perf_counter()
+                                hold_dt = 1.0 / max(1.0, float(self.hold_resend_hz))
+                                if (now_hold - self._last_hold_resend_time) >= hold_dt:
+                                    try:
+                                        if self.enable_velocity_feedforward:
+                                            self.serial.send_pitch_yaw_velocity(
+                                                self.last_sent_pitch,
+                                                self.last_sent_roll,
+                                                0.0,
+                                                0.0
+                                            )
+                                        else:
+                                            self.serial.send_pitch_yaw(
+                                                self.last_sent_pitch,
+                                                self.last_sent_roll
+                                            )
+                                        self._last_hold_resend_time = now_hold
+                                    except Exception as e:
+                                        print(f"[串口重发] 失败: {e}")
                         else:
                             pitch_deg_filtered = pitch_deg_raw = 0
                             roll_deg_filtered = roll_deg_raw = 0
@@ -1330,7 +1537,11 @@ class AerialTrackingSystem:
                               (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
                               (0, 255, 255), 2)
                 else:
-                    self.target_lost_frames += 1
+                    if should_detect:
+                        self.target_lost_frames += 1
+
+                        if self.scan_enabled and self.target_lost_frames >= max(1, int(self.scan_enter_lost_frames)):
+                            self._start_scan()
                     
                     # 如果连续丢失太多帧，重置跟踪
                     if self.target_lost_frames > self.max_lost_frames:
@@ -1342,6 +1553,13 @@ class AerialTrackingSystem:
                     cv2.putText(frame, f"No Target (Lost:{self.target_lost_frames})", 
                               (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, 
                               (0, 0, 255), 2)
+
+                # 扫描模式：在失锁期间主动发送扫描命令
+                if self.scan_active:
+                    scan_pitch, scan_roll = self._update_scan_target(loop_dt)
+                    self._send_absolute_command(scan_pitch, scan_roll, zero_velocity=True, tag="SCAN")
+                    cv2.putText(frame, f"SCAN {self.scan_pattern.upper()}", (10, 300),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
                 
                 self.total_frames += 1
 
@@ -1456,6 +1674,16 @@ class AerialTrackingSystem:
                         print(f"  步长限制: pitch={self.max_step_deg_pitch:.2f}°, roll={self.max_step_deg_roll:.2f}°")
                         print(f"  命令平滑: pitch={self.command_smooth_pitch:.2f}, roll={self.command_smooth_roll:.2f}")
                         print(f"  Pitch换向抑制: {self.pitch_reversal_damping:.2f} (窗口={self.pitch_reversal_window_deg:.2f}°)")
+                        print(f"  非检测帧重发: {'启用' if self.hold_resend_enabled else '禁用'} @ {self.hold_resend_hz:.1f}Hz")
+                        print(f"扫描模式: {'启用' if self.scan_enabled else '禁用'} ({self.scan_pattern})")
+                        print(f"  进入阈值: lost>={self.scan_enter_lost_frames} 检测帧")
+                        print(f"  重获确认: {self.scan_reacq_confirm_frames} 帧")
+                        if str(self.scan_pattern).lower() == 'spiral':
+                            print(f"  spiral: spacing={self.scan_spiral_spacing_deg:.2f}°, speed={self.scan_spiral_speed_deg_s:.2f}°/s, r_max={self.scan_spiral_r_max_deg:.2f}°")
+                            print(f"  scan_scale: k_roll={self.scan_k_roll:.2f}, k_pitch={self.scan_k_pitch:.2f}, return={self.scan_spiral_return}")
+                        else:
+                            print(f"  circle: radius={self.scan_radius_deg:.2f}°, rate={self.scan_rate_hz:.2f}Hz")
+                            print(f"  scan_scale: k_roll={self.scan_k_roll:.2f}, k_pitch={self.scan_k_pitch:.2f}")
                         print(f"像素补偿: dx={self.aim_pixel_offset[0]:.1f}px, dy={self.aim_pixel_offset[1]:.1f}px")
                         print(f"相机线程: {'启用' if self.use_camera_thread else '禁用'}")
                         if self.use_camera_thread:
@@ -1477,6 +1705,12 @@ class AerialTrackingSystem:
                         # 停止线程
                         self.camera.stopped = True
                         print("✓ 相机独立线程已禁用（切换到同步模式）")
+                elif key == ord('o'):
+                    # 手动切换失锁扫描开关
+                    self.scan_enabled = not self.scan_enabled
+                    if not self.scan_enabled:
+                        self._stop_scan("manual_off")
+                    print(f"✓ 扫描模式已{'启用' if self.scan_enabled else '禁用'}")
                 elif key == ord('z'):
                     # 减小死区阈值
                     self.deadzone_pitch = max(0.02, self.deadzone_pitch - 0.02)
@@ -1543,6 +1777,18 @@ if __name__ == "__main__":
     VEHICLE_MODEL = config.get('models', {}).get('vehicle', None)
     ARMOR_MODEL = config.get('models', {}).get('armor', 'best.pt')
     LASER_DATA_YAML = config.get('models', {}).get('data_yaml', 'data2_laser.yaml')
+
+    # 检测器参数（来自 detector.armor）
+    detector_cfg = config.get('detector', {})
+    armor_det_cfg = detector_cfg.get('armor', {}) if isinstance(detector_cfg, dict) else {}
+    laser_img_size_cfg = armor_det_cfg.get('img_size', [640, 640])
+    if not isinstance(laser_img_size_cfg, (list, tuple)) or len(laser_img_size_cfg) < 2:
+        laser_img_size_cfg = [640, 640]
+    LASER_IMG_SIZE = (int(laser_img_size_cfg[0]), int(laser_img_size_cfg[1]))
+    LASER_CONF_THRES = float(armor_det_cfg.get('conf_thres', 0.25))
+    LASER_IOU_THRES = float(armor_det_cfg.get('iou_thres', 0.45))
+    LASER_MAX_DET = int(armor_det_cfg.get('max_det', 1))
+
     SERIAL_PORT = config.get('serial', {}).get('port', 'COM8')
     BAUDRATE = config.get('serial', {}).get('baudrate', 115200)
     ENABLE_VELOCITY_FEEDFORWARD = config.get('serial', {}).get('enable_velocity_feedforward', True)
@@ -1573,6 +1819,12 @@ if __name__ == "__main__":
     MAX_RATE_PITCH = pk_cfg.get('max_rate_pitch', 60.0)
     MAX_RATE_ROLL = pk_cfg.get('max_rate_roll', 60.0)
 
+    # ========== 失锁扫描参数 ==========
+    scan_cfg = config.get('scan', {})
+
+    # ========== 跟踪参数 ==========
+    tracking_cfg = config.get('tracking', {})
+
     # 从标定文件加载
     USE_CALIBRATION_FILE = calib_cfg.get('use_file', False)
     CALIBRATION_FILE = calib_cfg.get('file_path', 'camera_params.npz')
@@ -1599,7 +1851,10 @@ if __name__ == "__main__":
     print(f"串口: {SERIAL_PORT} @ {BAUDRATE}")
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
+    print(f"检测参数: img_size={LASER_IMG_SIZE}, conf={LASER_CONF_THRES}, iou={LASER_IOU_THRES}, max_det={LASER_MAX_DET}")
     print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
+    if isinstance(scan_cfg, dict):
+        print(f"失锁扫描: {'启用' if scan_cfg.get('enabled', True) else '禁用'} ({scan_cfg.get('pattern', 'spiral')})")
     print(f"像素补偿: {config.get('pixel_offset', [0.0, 0.0])}")
     print("="*60)
 
@@ -1619,6 +1874,10 @@ if __name__ == "__main__":
             enable_undistort=ENABLE_UNDISTORT,
             camera_exposure=CAMERA_EXPOSURE,
             camera_gain=CAMERA_GAIN,
+            laser_img_size=LASER_IMG_SIZE,
+            laser_conf_thres=LASER_CONF_THRES,
+            laser_iou_thres=LASER_IOU_THRES,
+            laser_max_det=LASER_MAX_DET,
             kalman_prediction_time_ms=KALMAN_PREDICTION_TIME_MS,
             kalman_process_noise=KALMAN_PROCESS_NOISE,
             kalman_measurement_noise=KALMAN_MEASUREMENT_NOISE,
@@ -1686,6 +1945,44 @@ if __name__ == "__main__":
                 tracker.pitch_reversal_damping = min(1.0, max(0.1, float(ctrl_cfg['pitch_reversal_damping'])))
             if 'pitch_reversal_window_deg' in ctrl_cfg:
                 tracker.pitch_reversal_window_deg = max(0.2, float(ctrl_cfg['pitch_reversal_window_deg']))
+            if 'hold_resend_enabled' in ctrl_cfg:
+                tracker.hold_resend_enabled = bool(ctrl_cfg['hold_resend_enabled'])
+            if 'hold_resend_hz' in ctrl_cfg:
+                tracker.hold_resend_hz = max(1.0, float(ctrl_cfg['hold_resend_hz']))
+
+        # 从配置文件读取跟踪参数
+        if isinstance(tracking_cfg, dict):
+            if 'max_lost_frames' in tracking_cfg:
+                tracker.max_lost_frames = max(1, int(tracking_cfg['max_lost_frames']))
+            if 'max_distance' in tracking_cfg:
+                tracker.max_target_jump_distance = max(10.0, float(tracking_cfg['max_distance']))
+
+        # 从配置文件读取失锁扫描参数
+        if isinstance(scan_cfg, dict):
+            if 'enabled' in scan_cfg:
+                tracker.scan_enabled = bool(scan_cfg['enabled'])
+            if 'pattern' in scan_cfg:
+                tracker.scan_pattern = str(scan_cfg['pattern']).lower()
+            if 'enter_lost_frames' in scan_cfg:
+                tracker.scan_enter_lost_frames = max(1, int(scan_cfg['enter_lost_frames']))
+            if 'reacq_confirm_frames' in scan_cfg:
+                tracker.scan_reacq_confirm_frames = max(1, int(scan_cfg['reacq_confirm_frames']))
+            if 'circle_radius_deg' in scan_cfg:
+                tracker.scan_radius_deg = max(0.2, float(scan_cfg['circle_radius_deg']))
+            if 'circle_rate_hz' in scan_cfg:
+                tracker.scan_rate_hz = max(0.01, float(scan_cfg['circle_rate_hz']))
+            if 'spiral_spacing_deg' in scan_cfg:
+                tracker.scan_spiral_spacing_deg = max(0.2, float(scan_cfg['spiral_spacing_deg']))
+            if 'spiral_speed_deg_s' in scan_cfg:
+                tracker.scan_spiral_speed_deg_s = max(0.5, float(scan_cfg['spiral_speed_deg_s']))
+            if 'spiral_r_max_deg' in scan_cfg:
+                tracker.scan_spiral_r_max_deg = max(0.5, float(scan_cfg['spiral_r_max_deg']))
+            if 'spiral_return' in scan_cfg:
+                tracker.scan_spiral_return = bool(scan_cfg['spiral_return'])
+            if 'k_roll' in scan_cfg:
+                tracker.scan_k_roll = max(0.2, float(scan_cfg['k_roll']))
+            if 'k_pitch' in scan_cfg:
+                tracker.scan_k_pitch = max(0.2, float(scan_cfg['k_pitch']))
 
         # 像素补偿：激光点相对画面中心的固定偏差(dx,dy)
         po_cfg = config.get('pixel_offset', [0.0, 0.0])
@@ -1702,6 +1999,7 @@ if __name__ == "__main__":
         print("  z/x - 减小/增大死区阈值")
         print("  m - 重置云台姿态记录（重新以当前为初始）")
         print("  p - 显示当前系统参数")
+        print("  o - 手动切换扫描开关")
         print("  t - 切换相机线程模式（异步/同步）")
         print("  i - 切换帧间隔控制")
         print("  ,/. - 减小/增大帧间隔")

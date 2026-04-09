@@ -94,11 +94,32 @@ gimbal:
     smooth_roll: 0.88           # roll可稍激进，兼顾响应
     pitch_reversal_damping: 0.55 # pitch误差小范围换向时抑制系数，防止来回打舵
     pitch_reversal_window_deg: 1.30
+    hold_resend_enabled: true   # 非检测帧重发上一条绝对角命令，提升链路稳定性
+    hold_resend_hz: 60.0        # 命令重发上限频率（受主循环帧率限制）
 
 # 目标跟踪
 tracking:
   max_lost_frames: 10           # 最大丢失帧数
   max_distance: 200             # 目标关联最大距离（像素）
+
+# 失锁主动扫描（不改下位机协议）
+scan:
+  enabled: true
+  pattern: 'spiral'             # spiral | circle
+  enter_lost_frames: 3          # 连续丢失多少个“检测帧”后启动扫描
+  reacq_confirm_frames: 2       # 连续检测到多少个“检测帧”后退出扫描
+
+  # circle参数
+  circle_radius_deg: 4.0
+  circle_rate_hz: 0.20
+
+  # spiral参数（默认推荐）
+  spiral_spacing_deg: 1.8       # 每圈间距（度）
+  spiral_speed_deg_s: 10.0      # 路径速度（度/秒）
+  spiral_r_max_deg: 10.0        # 最大半径（度）
+  spiral_return: false          # 到达最大半径后是否回扫
+  k_roll: 1.4                   # 横向扫描尺度
+  k_pitch: 1.0                  # 纵向扫描尺度
   
 # 可视化
 visualization:
