@@ -1,9 +1,10 @@
 
 # 模型路径
 models:
-  # aerial: 'models/aerial.pt'     # 无人机检测模型（第二层策略用，当前未启用）
+  aerial: 'lasertracking/aerial.pt' # 无人机检测模型（YOLO26n）
   armor: 'best.pt'              # 激光检测模块训练权重
-  data_yaml: 'laser.yaml' # 对应的数据集配置文件（nc=1, names: laser）
+  data_yaml: 'laser.yaml' # 激光模块数据集配置文件（nc=1, names: laser）
+  aerial_class_name: 'item'      # 无人机类别名偏好；不匹配时自动回退最高置信度
   
 # 串口配置
 serial:

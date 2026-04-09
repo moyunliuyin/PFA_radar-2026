@@ -444,6 +444,7 @@ class AerialTrackingSystem:
     当前使用：best.pt 训练权重 + data2_laser.yaml（单类 laser 检测）
     """
     def __init__(self, aerial_model_path=None, laser_module_model_path=None,
+                 aerial_class_name='item',
                  laser_data_yaml='data2_laser.yaml',
                  serial_port='COM8', baudrate=115200,
                  serial_protocol='raw',
@@ -507,9 +508,27 @@ class AerialTrackingSystem:
         # 1. 直接全图检测激光模块（当前启用）
         # 2. 先检测无人机 → 再在无人机ROI中检测激光模块（已注释）
         
-        # 无人机检测器（用于第二层检测策略，当前已关闭）
-        # 如需启用：取消注释下方代码，并恢复 detect_laser_module() 中对应逻辑
+        # 无人机检测器（第一层ROI约束，可选）
         self.aerial_detector = None
+        self.aerial_class_name = str(aerial_class_name or '').strip().lower()
+        if aerial_model_path:
+            try:
+                self.aerial_detector = YOLOv5Detector(
+                    weights_path=aerial_model_path,
+                    img_size=(640, 640),
+                    conf_thres=0.15,
+                    iou_thres=0.45,
+                    max_det=6,
+                    device=self.device_str,
+                    classes=None,
+                    ui=True
+                )
+                print(f"  无人机检测模型: {aerial_model_path}")
+                if self.aerial_class_name:
+                    print(f"  无人机标签偏好: {self.aerial_class_name} (不匹配时回退最高置信度)")
+            except Exception as e:
+                print(f"⚠️  无人机模型加载失败，将仅使用激光模块全图检测: {e}")
+                self.aerial_detector = None
         # self.vehicle_detector = YOLOv5Detector(
         #     weights_path=vehicle_model_path,
         #     img_size=(640, 640),
@@ -949,6 +968,37 @@ class AerialTrackingSystem:
         h, w = frame.shape[:2]
         if self.frame_center is None:
             self.frame_center = (w // 2, h // 2)
+
+        best_aerial_bbox = None
+        best_aerial_conf = 0.0
+
+        if self.aerial_detector is not None:
+            try:
+                aerial_results = self.aerial_detector.predict(frame)
+                best_pref = None
+                best_any = None
+
+                for detection in aerial_results:
+                    aerial_cls, aerial_xywh, aerial_conf = detection
+                    ax, ay, aw, ah = aerial_xywh
+                    x1 = int(ax)
+                    y1 = int(ay)
+                    x2 = x1 + int(aw)
+                    y2 = y1 + int(ah)
+                    info = ((x1, y1, x2, y2), float(aerial_conf), str(aerial_cls).lower())
+
+                    if best_any is None or info[1] > best_any[1]:
+                        best_any = info
+                    if self.aerial_class_name and info[2] == self.aerial_class_name:
+                        if best_pref is None or info[1] > best_pref[1]:
+                            best_pref = info
+
+                chosen = best_pref if best_pref is not None else best_any
+                if chosen is not None:
+                    best_aerial_bbox = chosen[0]
+                    best_aerial_conf = chosen[1]
+            except Exception:
+                pass
     
         best_laser_module = None
         best_conf = 0
@@ -976,8 +1026,8 @@ class AerialTrackingSystem:
                         'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
                         'center': (center_x, center_y),
                         'conf': float(module_conf),
-                        'aerial_bbox': None,  # 预留：无人机框（第二层策略用）
-                        'aerial_conf': 0.0,
+                        'aerial_bbox': best_aerial_bbox,
+                        'aerial_conf': float(best_aerial_conf),
                         'class': module_cls,
                         'detect_method': 'direct'  # 直接检测
                     }
@@ -990,6 +1040,36 @@ class AerialTrackingSystem:
             self.detect_time = time.time() - detect_start
             return best_laser_module
         
+        # 若存在无人机框，优先在其ROI中搜索激光模块
+        if best_aerial_bbox is not None:
+            x1, y1, x2, y2 = best_aerial_bbox
+            roi = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            if roi.size > 0:
+                try:
+                    roi_results = self.laser_module_detector.predict(roi)
+                    for module_detection in roi_results:
+                        module_cls, module_xywh, module_conf = module_detection
+                        ax, ay, aw, ah = module_xywh
+                        abs_x1 = max(0, x1) + int(ax)
+                        abs_y1 = max(0, y1) + int(ay)
+                        abs_x2 = abs_x1 + int(aw)
+                        abs_y2 = abs_y1 + int(ah)
+                        center_x = (abs_x1 + abs_x2) // 2
+                        center_y = (abs_y1 + abs_y2) // 2
+                        if module_conf > best_conf:
+                            best_laser_module = {
+                                'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
+                                'center': (center_x, center_y),
+                                'conf': float(module_conf),
+                                'aerial_bbox': best_aerial_bbox,
+                                'aerial_conf': float(best_aerial_conf),
+                                'class': module_cls,
+                                'detect_method': 'aerial_roi'
+                            }
+                            best_conf = float(module_conf)
+                except Exception:
+                    pass
+
         # 在上一帧位置附近搜索（目标短暂丢失时的恢复策略）
         if self.last_target_pos is not None:
             search_x, search_y = self.last_target_pos
@@ -1021,8 +1101,8 @@ class AerialTrackingSystem:
                             'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
                             'center': (center_x, center_y),
                             'conf': float(module_conf),
-                            'aerial_bbox': None,
-                            'aerial_conf': 0.0,
+                            'aerial_bbox': best_aerial_bbox,
+                            'aerial_conf': float(best_aerial_conf),
                             'class': module_cls,
                             'detect_method': 'search_roi'
                         }
@@ -1589,9 +1669,10 @@ if __name__ == "__main__":
 
     # 配置参数 ===========================
     # 单模型模式：不需要车辆模型
-    VEHICLE_MODEL = config.get('models', {}).get('vehicle', None)
+    VEHICLE_MODEL = _resolve_path(config.get('models', {}).get('aerial', config.get('models', {}).get('vehicle', 'lasertracking/aerial.pt')))
     ARMOR_MODEL = _resolve_path(config.get('models', {}).get('armor', 'best.pt'))
     LASER_DATA_YAML = _resolve_path(config.get('models', {}).get('data_yaml', 'data2_laser.yaml'))
+    AERIAL_CLASS_NAME = str(config.get('models', {}).get('aerial_class_name', 'item'))
 
     # 检测器参数（来自 detector.armor）
     detector_cfg = config.get('detector', {})
@@ -1683,6 +1764,7 @@ if __name__ == "__main__":
         tracker = AerialTrackingSystem(
             aerial_model_path=VEHICLE_MODEL,  # 无人机检测模型（未使用）
             laser_module_model_path=ARMOR_MODEL,  # 激光模块检测模型
+            aerial_class_name=AERIAL_CLASS_NAME,
             laser_data_yaml=LASER_DATA_YAML,  # 数据集配置文件
             serial_port=SERIAL_PORT,
             baudrate=BAUDRATE,
