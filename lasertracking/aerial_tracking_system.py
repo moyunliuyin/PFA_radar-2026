@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 import time
-import threading
 from collections import deque
 import sys
 import os
@@ -9,15 +8,26 @@ import torch
 import warnings
 warnings.filterwarnings('ignore', message='.*torch.cuda.amp.autocast.*')
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
 # 导入独立的串口通信模块
 from serial_comm import create_serial
+
+# 导入线程化相机包装器
+from camera_thread import ThreadedCamera
 
 # 导入YOLO检测器
 from detect_function import YOLOv5Detector
 
 # 导入海康相机接口
 try:
-    sys.path.append("./MvImport")
+    mvimport_path = os.path.join(PROJECT_ROOT, "MvImport")
+    if mvimport_path not in sys.path:
+        sys.path.append(mvimport_path)
     from MvImport.MvCameraControl_class import *
 except ImportError:
     print("请确保海康相机SDK已正确安装")
@@ -418,107 +428,6 @@ class HikCameraCapture:
             print("相机已释放")
 
 
-class ThreadedCamera:
-    """线程化相机包装器 - 独立线程持续采集最新帧
-    
-    优点：
-    - 相机取帧不阻塞主循环
-    - 总能获取最新帧（减少延迟）
-    - FPS更稳定（避免read超时卡住）
-    - 主循环的dt仍然确定（控制精度不受影响）
-    """
-    def __init__(self, camera, enable_thread=True):
-        """
-        Args:
-            camera: HikCameraCapture 实例
-            enable_thread: 是否启用独立线程（False则退化为普通模式）
-        """
-        self.camera = camera
-        self.enable_thread = enable_thread
-        self.frame = None
-        self.ret = False
-        self.lock = threading.Lock()
-        self.stopped = False
-        self.frame_count = 0
-        
-        if self.enable_thread:
-            # 启动采集线程
-            self.thread = threading.Thread(target=self._update_loop, daemon=True)
-            self.thread.start()
-            # 等待第一帧就绪（最多5秒）
-            print("⏳ 等待相机采集第一帧...", end='', flush=True)
-            deadline = time.time() + 5.0
-            while time.time() < deadline:
-                with self.lock:
-                    if self.frame is not None:
-                        break
-                time.sleep(0.05)
-            else:
-                print(" 超时! 请检查相机连接")
-            print(" OK")
-            print("✓ 相机独立线程已启动（异步采集最新帧）")
-        else:
-            print("✓ 相机运行在同步模式（主循环直接调用read）")
-    
-    def _update_loop(self):
-        """独立线程：持续采集最新帧"""
-        while not self.stopped:
-            try:
-                ret, frame = self.camera.read()
-                if ret:
-                    with self.lock:
-                        self.frame = frame
-                        self.ret = True
-                        self.frame_count += 1
-            except Exception as e:
-                print(f"⚠️ 相机线程读取异常: {e}")
-                time.sleep(0.01)
-    
-    def read(self):
-        """获取最新帧（主循环调用）"""
-        if not self.enable_thread:
-            # 同步模式：直接调用底层相机
-            return self.camera.read()
-        
-        # 异步模式：返回线程采集的最新帧
-        with self.lock:
-            if self.frame is None:
-                return False, None
-            return self.ret, self.frame.copy()
-    
-    def get_frame_count(self):
-        """获取采集帧计数（仅异步模式有效）"""
-        if not self.enable_thread:
-            return 0
-        with self.lock:
-            return self.frame_count
-    
-    def release(self):
-        """停止线程并释放相机"""
-        if self.enable_thread:
-            self.stopped = True
-            if hasattr(self, 'thread'):
-                self.thread.join(timeout=2.0)
-            print("相机采集线程已停止")
-        self.camera.release()
-    
-    def set_camera_params(self, exposure_time=None, gain=None):
-        """透传：设置相机参数"""
-        return self.camera.set_camera_params(exposure_time, gain)
-    
-    def get_camera_params(self):
-        """透传：获取相机参数"""
-        return self.camera.get_camera_params()
-    
-    @property
-    def exposure_time(self):
-        return self.camera.exposure_time
-    
-    @property
-    def gain(self):
-        return self.camera.gain
-
-
 class AerialTrackingSystem:
     """无人机激光检测模块跟踪系统
     
@@ -536,7 +445,11 @@ class AerialTrackingSystem:
     """
     def __init__(self, aerial_model_path=None, laser_module_model_path=None,
                  laser_data_yaml='data2_laser.yaml',
-                 serial_port='COM8', baudrate=115200, use_gpu=True,
+                 serial_port='COM8', baudrate=115200,
+                 serial_protocol='raw',
+                 serial_enable_feedback=False,
+                 feedback_timeout_ms=200.0,
+                 use_gpu=True,
                  camera_fx=15989.09, camera_fy=15985.61,
                  camera_cx=None, camera_cy=None,
                  dist_coeffs=None, enable_undistort=True,
@@ -652,7 +565,22 @@ class AerialTrackingSystem:
         
         # 使用独立串口模块
         print(f"初始化串口通信...")
-        self.serial = create_serial(port=serial_port, baudrate=baudrate, raw_payload=True)
+        self.serial_protocol = str(serial_protocol).lower()
+        self.serial_enable_feedback = bool(serial_enable_feedback)
+        self.feedback_timeout_s = max(0.02, float(feedback_timeout_ms) / 1000.0)
+        self.use_feedback_state = self.serial_enable_feedback
+        self._last_feedback_time = 0.0
+        self._last_feedback_state = None
+
+        self.serial = create_serial(
+            port=serial_port,
+            baudrate=baudrate,
+            raw_payload=(self.serial_protocol != 'framed'),
+            protocol_mode=self.serial_protocol,
+            enable_feedback=self.serial_enable_feedback
+        )
+        print(f"✓ 串口协议模式: {self.serial_protocol}")
+        print(f"✓ 回传姿态: {'启用' if self.serial_enable_feedback else '禁用'} (timeout={self.feedback_timeout_s*1000:.0f}ms)")
 
         # 使用卡尔曼预测滤波器（带延迟补偿）
         self.angle_filter = PredictiveKalmanFilter(
@@ -673,7 +601,7 @@ class AerialTrackingSystem:
         if enable_velocity_feedforward:
             print(f"✓ 速度前馈已启用（发送位置+速度到下位机，16字节）")
         else:
-            print(f"✓ 速度前馈已禁用（仅发送位置，8字节）")
+            print(f"✓ 速度前馈已禁用（仅位置接口，但raw仍发送16字节：速度置0）")
 
         # 死区控制参数
         # 当角度变化量小于死区阈值时，保持上次角度不变（保持姿态），速度设为0
@@ -694,15 +622,6 @@ class AerialTrackingSystem:
         # 目标角 = 上次发送角 + Kp * 误差角（避免把误差当增量累加导致风up/摆动）
         self.control_gain_pitch = 1.0
         self.control_gain_roll = 1.0
-        # D项：基于误差变化率的阻尼（刹车）
-        self.control_kd_pitch = 0.12
-        self.control_kd_roll = 0.12
-        self.control_d_alpha = 0.6  # D项低通系数(0-1)，越大越平滑
-        self._last_err_pitch = 0.0
-        self._last_err_roll = 0.0
-        self._d_pitch_filt = 0.0
-        self._d_roll_filt = 0.0
-        self._last_control_time = None
         self.max_step_deg_pitch = 3.0  # 单次更新最大步长（度），抑制过冲
         self.max_step_deg_roll = 3.0
         self.command_smooth_pitch = 0.72  # (0,1]，越小越平滑
@@ -749,6 +668,10 @@ class AerialTrackingSystem:
         self.target_lost_frames = 0
         self.max_lost_frames = 10  # 最大丢失帧数
         self.max_target_jump_distance = 200.0  # 目标突变判定阈值（像素）
+        self.target_switch_confirm_frames = 2   # 新目标需连续确认帧数
+        self.target_switch_consistency_px = 80.0  # 新目标候选一致性阈值（像素）
+        self._pending_target_center = None
+        self._pending_target_count = 0
 
         # 失锁主动扫描状态机（上位机侧，不修改下位机协议）
         self.scan_enabled = True
@@ -771,7 +694,6 @@ class AerialTrackingSystem:
         self.scan_phase = 0.0
         self.scan_theta = 0.0
         self.scan_dir = 1
-        self._scan_last_time = 0.0
 
         # 云台姿态记录器：维护相对于初始位置的绝对角度
         self.gimbal_pose = GimbalPoseRecorder()
@@ -787,7 +709,6 @@ class AerialTrackingSystem:
         self.scan_phase = 0.0
         self.scan_theta = 0.0
         self.scan_dir = 1
-        self._scan_last_time = time.perf_counter()
         print(f"[扫描] 启动 pattern={self.scan_pattern}, center=({self.scan_center_pitch:.2f},{self.scan_center_roll:.2f})")
 
     def _stop_scan(self, reason=""):
@@ -857,21 +778,31 @@ class AerialTrackingSystem:
         return float(target_pitch), float(target_roll)
 
     def _send_absolute_command(self, target_pitch, target_roll, zero_velocity=True, tag="ABS"):
+        base_pitch = float(self.last_sent_pitch)
+        base_roll = float(self.last_sent_roll)
+        if self.use_feedback_state:
+            state = self.serial.get_latest_state(max_age_s=self.feedback_timeout_s)
+            if state is not None:
+                base_pitch = float(state.get('pitch', base_pitch))
+                base_roll = float(state.get('roll', base_roll))
+                self._last_feedback_state = state
+                self._last_feedback_time = time.time()
+
         pitch_cmd = float(target_pitch)
         roll_cmd = float(target_roll)
 
         # 与常规控制一致：限步 + 一阶平滑
         if self.max_step_deg_pitch is not None and self.max_step_deg_pitch > 0:
-            dp = pitch_cmd - self.last_sent_pitch
+            dp = pitch_cmd - base_pitch
             dp = max(-self.max_step_deg_pitch, min(self.max_step_deg_pitch, dp))
-            pitch_cmd = self.last_sent_pitch + dp
+            pitch_cmd = base_pitch + dp
         if self.max_step_deg_roll is not None and self.max_step_deg_roll > 0:
-            dr = roll_cmd - self.last_sent_roll
+            dr = roll_cmd - base_roll
             dr = max(-self.max_step_deg_roll, min(self.max_step_deg_roll, dr))
-            roll_cmd = self.last_sent_roll + dr
+            roll_cmd = base_roll + dr
 
-        pitch_cmd = self.last_sent_pitch + self.command_smooth_pitch * (pitch_cmd - self.last_sent_pitch)
-        roll_cmd = self.last_sent_roll + self.command_smooth_roll * (roll_cmd - self.last_sent_roll)
+        pitch_cmd = base_pitch + self.command_smooth_pitch * (pitch_cmd - base_pitch)
+        roll_cmd = base_roll + self.command_smooth_roll * (roll_cmd - base_roll)
 
         send_pitch = round(float(pitch_cmd), 2)
         send_roll = round(float(roll_cmd), 2)
@@ -891,6 +822,118 @@ class AerialTrackingSystem:
                 self.serial.send_pitch_yaw(send_pitch, send_roll)
         except Exception as e:
             print(f"[{tag}] 命令发送异常: {e}")
+
+    def _get_display_data_or_default(self):
+        """返回缓存显示数据，不存在则给出默认值。"""
+        if hasattr(self, '_display_data'):
+            d = self._display_data
+            return (
+                d['pitch_deg_filtered'],
+                d['pitch_deg_raw'],
+                d['roll_deg_filtered'],
+                d['roll_deg_raw'],
+                d['pixel_offset_x'],
+                d['pixel_offset_y'],
+                d.get('aim_x', float(self.frame_center[0])),
+                d.get('aim_y', float(self.frame_center[1]))
+            )
+        return (0, 0, 0, 0, 0, 0, float(self.frame_center[0]), float(self.frame_center[1]))
+
+    def _resend_hold_command_if_needed(self):
+        """非检测帧重发上一条命令，避免发送频率过低。"""
+        if not self.hold_resend_enabled or self.scan_active:
+            return
+        now_hold = time.perf_counter()
+        hold_dt = 1.0 / max(1.0, float(self.hold_resend_hz))
+        if (now_hold - self._last_hold_resend_time) < hold_dt:
+            return
+        try:
+            if self.enable_velocity_feedforward:
+                self.serial.send_pitch_yaw_velocity(
+                    self.last_sent_pitch,
+                    self.last_sent_roll,
+                    0.0,
+                    0.0
+                )
+            else:
+                self.serial.send_pitch_yaw(
+                    self.last_sent_pitch,
+                    self.last_sent_roll
+                )
+            self._last_hold_resend_time = now_hold
+        except Exception as e:
+            print(f"[串口重发] 失败: {e}")
+
+    def _draw_detection_overlay(self, frame, laser_module,
+                                pitch_deg_filtered, pitch_deg_raw,
+                                roll_deg_filtered, roll_deg_raw,
+                                pixel_offset_x, pixel_offset_y):
+        """绘制目标检测与控制信息。"""
+        if laser_module.get('aerial_bbox') is not None:
+            ax1, ay1, ax2, ay2 = laser_module['aerial_bbox']
+            cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (255, 0, 0), 2)
+            cv2.putText(frame, f"Aerial {laser_module['aerial_conf']:.2f}",
+                        (ax1, ay1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5, (255, 0, 0), 4)
+
+        bbox = laser_module['bbox']
+        cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 4)
+
+        detect_method = laser_module.get('detect_method', 'unknown')
+        method_color = (0, 255, 0) if detect_method == 'direct' else (255, 165, 0)
+        cv2.putText(frame, "laser_module",
+                    (bbox[0], bbox[1] - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6, method_color, 2)
+
+        cv2.putText(frame, f"Pitch: {pitch_deg_filtered:.2f}deg (raw:{pitch_deg_raw:.2f})",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2)
+        cv2.putText(frame, f"Roll: {roll_deg_filtered:.2f}deg (raw:{roll_deg_raw:.2f})",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2)
+        cv2.putText(frame, f"Offset: ({pixel_offset_x:.0f}, {pixel_offset_y:.0f})",
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (150, 150, 150), 2)
+        cv2.putText(frame, f"Conf: {laser_module['conf']:.2f}",
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                    (0, 255, 255), 2)
+
+    def _draw_common_overlay(self, frame):
+        """绘制公共UI：瞄准点、状态、性能信息。"""
+        aim_draw = (
+            int(round(self.frame_center[0] + self.aim_pixel_offset[0])),
+            int(round(self.frame_center[1] + self.aim_pixel_offset[1]))
+        )
+
+        cv2.line(frame, (self.frame_center[0] - 20, self.frame_center[1]),
+                 (self.frame_center[0] + 20, self.frame_center[1]), (255, 255, 255), 2)
+        cv2.line(frame, (self.frame_center[0], self.frame_center[1] - 20),
+                 (self.frame_center[0], self.frame_center[1] + 20), (255, 255, 255), 2)
+        cv2.circle(frame, self.frame_center, 3, (255, 255, 255), -1)
+
+        cv2.drawMarker(frame, aim_draw, (255, 255, 0), markerType=cv2.MARKER_CROSS,
+                       markerSize=24, thickness=2)
+        if self.deadzone_enabled:
+            cv2.circle(frame, aim_draw, int(self.deadzone_visual_radius), (0, 255, 0), 2)
+
+        current_time = time.time()
+        self.fps = 1 / (current_time - self.fps_time)
+        self.fps_time = current_time
+
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"Detect: {self.detect_time*1000:.1f}ms", (10, 180),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 210),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        cv2.putText(frame, "Filter: Kalman-Pred", (10, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+
+        pose_pitch, pose_roll = self.gimbal_pose.get_pose()
+        cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 270),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+
+        cv2.imshow('Laser Module Tracking System', frame)
         
     def detect_laser_module(self, frame):
         """检测激光检测模块
@@ -946,71 +989,6 @@ class AerialTrackingSystem:
         if best_laser_module is not None:
             self.detect_time = time.time() - detect_start
             return best_laser_module
-        
-        # ===== 策略2：先检测无人机 → 再检测激光模块（已关闭）=====
-        # if self.aerial_detector:
-        #     aerial_results = self.aerial_detector.predict(frame)
-        #     for detection in aerial_results:
-        #         cls, xywh, conf = detection
-        #         if cls == 'aerial':  # 检测到无人机
-        #             # 在无人机ROI中检测激光模块
-        #             # ... (ROI裁剪和激光模块检测逻辑)
-        #             pass
-        # vehicle_results = self.vehicle_detector.predict(frame)
-        # for detection in vehicle_results:
-        #     cls, xywh, conf = detection
-        #     if cls == 'car':
-        #         self.vehicle_detect_count += 1
-        #         left, top, w_box, h_box = xywh
-        #         left, top, w_box, h_box = int(left), int(top), int(w_box), int(h_box)
-        #
-        #         expand_ratio = 0.15
-        #         expand_x = int(w_box * expand_ratio)
-        #         expand_y = int(h_box * expand_ratio)
-        #
-        #         x1 = max(0, left - expand_x)
-        #         y1 = max(0, top - expand_y)
-        #         x2 = min(w, left + w_box + expand_x)
-        #         y2 = min(h, top + h_box + expand_y)
-        #
-        #         roi_w = x2 - x1
-        #         roi_h = y2 - y1
-        #         if roi_w < 20 or roi_h < 20:
-        #             continue
-        #
-        #         vehicle_roi = frame[y1:y2, x1:x2]
-        #         if vehicle_roi.size == 0:
-        #             continue
-        #
-        #         armor_results = self.armor_detector.predict(vehicle_roi)
-        #         for armor_detection in armor_results:
-        #             armor_cls, armor_xywh, armor_conf = armor_detection
-        #             self.armor_detect_count += 1
-        #             ax, ay, aw, ah = armor_xywh
-        #
-        #             abs_x1 = x1 + int(ax)
-        #             abs_y1 = y1 + int(ay)
-        #             abs_x2 = abs_x1 + int(aw)
-        #             abs_y2 = abs_y1 + int(ah)
-        #
-        #             center_x = (abs_x1 + abs_x2) // 2
-        #             center_y = (abs_y1 + abs_y2) // 2
-        #
-        #             if armor_conf > best_conf:
-        #                 best_armor = {
-        #                     'bbox': (abs_x1, abs_y1, abs_x2, abs_y2),
-        #                     'center': (center_x, center_y),
-        #                     'conf': float(armor_conf),
-        #                     'vehicle_bbox': (left, top, left + w_box, top + h_box),
-        #                     'vehicle_conf': float(conf),
-        #                     'class': armor_cls,
-        #                     'detect_method': 'vehicle_roi'
-        #                 }
-        #                 best_conf = float(armor_conf)
-        #
-        # if best_armor is not None:
-        #     self.detect_time = time.time() - detect_start
-        #     return best_armor
         
         # 在上一帧位置附近搜索（目标短暂丢失时的恢复策略）
         if self.last_target_pos is not None:
@@ -1155,22 +1133,32 @@ class AerialTrackingSystem:
         if pitch_reversing:
             inc_pitch *= self.pitch_reversal_damping
         inc_roll  = effective_gain_roll  * err_roll_deg
-        target_pitch = self.last_sent_pitch + inc_pitch
-        target_roll  = self.last_sent_roll  + inc_roll
+        base_pitch = float(self.last_sent_pitch)
+        base_roll = float(self.last_sent_roll)
+        if self.use_feedback_state:
+            state = self.serial.get_latest_state(max_age_s=self.feedback_timeout_s)
+            if state is not None:
+                base_pitch = float(state.get('pitch', base_pitch))
+                base_roll = float(state.get('roll', base_roll))
+                self._last_feedback_state = state
+                self._last_feedback_time = time.time()
+
+        target_pitch = base_pitch + inc_pitch
+        target_roll  = base_roll  + inc_roll
 
         # 单次步长限制：避免目标快速变化/噪声导致过冲
         if self.max_step_deg_pitch is not None and self.max_step_deg_pitch > 0:
-            dp = target_pitch - self.last_sent_pitch
+            dp = target_pitch - base_pitch
             dp = max(-self.max_step_deg_pitch, min(self.max_step_deg_pitch, dp))
-            target_pitch = self.last_sent_pitch + dp
+            target_pitch = base_pitch + dp
         if self.max_step_deg_roll is not None and self.max_step_deg_roll > 0:
-            dr = target_roll - self.last_sent_roll
+            dr = target_roll - base_roll
             dr = max(-self.max_step_deg_roll, min(self.max_step_deg_roll, dr))
-            target_roll = self.last_sent_roll + dr
+            target_roll = base_roll + dr
 
         # 一阶平滑，降低检测离散和量化带来的命令抖动
-        target_pitch = self.last_sent_pitch + self.command_smooth_pitch * (target_pitch - self.last_sent_pitch)
-        target_roll = self.last_sent_roll + self.command_smooth_roll * (target_roll - self.last_sent_roll)
+        target_pitch = base_pitch + self.command_smooth_pitch * (target_pitch - base_pitch)
+        target_roll = base_roll + self.command_smooth_roll * (target_roll - base_roll)
 
         send_pitch = round(float(target_pitch), 2)
         send_roll = round(float(target_roll), 2)
@@ -1234,11 +1222,6 @@ class AerialTrackingSystem:
                 # 到位抑摆：连续在死区内若干帧后，清零滤波器速度，避免速度前馈残留导致来回摆
                 if self._deadzone_streak >= self.deadzone_settle_frames:
                     self.angle_filter.zero_velocity()
-                    # 到位时把微分状态也“对齐”，避免下一帧D项突变
-                    self._d_pitch_filt = 0.0
-                    self._d_roll_filt = 0.0
-                    self._last_err_pitch = err_pitch_deg
-                    self._last_err_roll = err_roll_deg
                 # 每100次打印一次统计
                 if self.deadzone_skip_count % 100 == 0:
                     print(f"[死区] 保持姿态 {self.deadzone_skip_count} 次 (P={self.last_sent_pitch:.2f}° R={self.last_sent_roll:.2f}°, 误差: P={pitch_err_abs:.3f}° R={roll_err_abs:.3f}°)")
@@ -1263,7 +1246,7 @@ class AerialTrackingSystem:
                 # 新版：发送位置+速度（16字节）
                 result = self.serial.send_pitch_yaw_velocity(send_pitch, send_roll, v_pitch, v_roll)
             else:
-                # 旧版：仅发送位置（8字节）
+                # 仅位置接口（raw模式下仍为16字节，速度置0）
                 result = self.serial.send_pitch_yaw(send_pitch, send_roll)
 
             # 首次发送时显示详细信息
@@ -1276,7 +1259,7 @@ class AerialTrackingSystem:
                         print(f"  角速度: v_pitch={v_pitch:.2f}°/s, v_roll={v_roll:.2f}°/s")
                         print(f"  📦 数据格式: 位置+速度前馈 (16字节)")
                     else:
-                        print(f"  📦 数据格式: 仅位置 (8字节)")
+                        print(f"  📦 数据格式: 仅位置接口（raw=16字节，速度置0；framed=23字节）")
                     print(f"  💾 累积姿态：基于初始位置")
                     print(f"  🎯 死区控制: pitch={self.deadzone_pitch}°, roll={self.deadzone_roll}°")
                 else:
@@ -1318,6 +1301,13 @@ class AerialTrackingSystem:
                     self._last_loop_perf = loop_now
                 loop_dt = loop_now - self._last_loop_perf
                 self._last_loop_perf = loop_now
+
+                # 轮询下位机回传姿态（分帧协议）
+                if self.serial_enable_feedback:
+                    state = self.serial.poll_feedback(max_read=512)
+                    if state is not None:
+                        self._last_feedback_state = state
+                        self._last_feedback_time = time.time()
 
                 # 读取图像
                 ret, frame = self.camera.read()
@@ -1373,171 +1363,139 @@ class AerialTrackingSystem:
                     
                     # 只在检测帧进行跟踪更新和发送
                     if should_detect and not skip_tracking_update:
+                        target_switch_waiting = False
+                        confirmed_switch = False
+
                         # 更新目标跟踪
                         if self.last_target_pos is not None:
                             # 计算与上一帧的距离
                             dist = np.sqrt((center[0] - self.last_target_pos[0])**2 + 
                                           (center[1] - self.last_target_pos[1])**2)
-                            # 如果距离太大，可能是新目标，重置滤波器
+                            # 距离突变时先进入候选确认，避免单帧误检直接切主目标
                             if dist > self.max_target_jump_distance:
+                                cand = (float(center[0]), float(center[1]))
+                                if self._pending_target_center is None:
+                                    self._pending_target_center = cand
+                                    self._pending_target_count = 1
+                                else:
+                                    p = self._pending_target_center
+                                    pd = np.sqrt((cand[0] - p[0])**2 + (cand[1] - p[1])**2)
+                                    if pd <= self.target_switch_consistency_px:
+                                        n = self._pending_target_count + 1
+                                        self._pending_target_center = (
+                                            (p[0] * self._pending_target_count + cand[0]) / n,
+                                            (p[1] * self._pending_target_count + cand[1]) / n,
+                                        )
+                                        self._pending_target_count = n
+                                    else:
+                                        self._pending_target_center = cand
+                                        self._pending_target_count = 1
+
+                                if self._pending_target_count >= max(1, int(self.target_switch_confirm_frames)):
+                                    confirmed_switch = True
+                                    c = self._pending_target_center
+                                    center = (int(round(c[0])), int(round(c[1])))
+                                    self._pending_target_center = None
+                                    self._pending_target_count = 0
+                                else:
+                                    target_switch_waiting = True
+                            else:
+                                self._pending_target_center = None
+                                self._pending_target_count = 0
+
+                        if target_switch_waiting:
+                            # 候选目标确认阶段：保持上一控制输出，避免误检牵引
+                            (pitch_deg_filtered, pitch_deg_raw,
+                             roll_deg_filtered, roll_deg_raw,
+                             pixel_offset_x, pixel_offset_y,
+                             aim_x, aim_y) = self._get_display_data_or_default()
+                        else:
+                            if confirmed_switch:
                                 self.target_id += 1
                                 self.angle_filter.reset()
                                 self.track_initialized = False
                                 self.trajectory.clear()
                         
-                        self.last_target_pos = center
-                        self.target_lost_frames = 0
-                        self.track_initialized = True
+                            self.last_target_pos = center
+                            self.target_lost_frames = 0
+                            self.track_initialized = True
                         
-                        # 使用装甲板中心的像素坐标（相对画面左上角）
-                        pixel_x = float(center[0])
-                        pixel_y = float(center[1])
+                            # 使用装甲板中心的像素坐标（相对画面左上角）
+                            pixel_x = float(center[0])
+                            pixel_y = float(center[1])
 
-                        # 补偿后的瞄准点：相对画面中心平移(dx,dy)
-                        aim_x = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
-                        aim_y = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
+                            # 补偿后的瞄准点：相对画面中心平移(dx,dy)
+                            aim_x = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
+                            aim_y = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
                         
-                        # 像素坐标转换为云台误差角（弧度）
-                        # 内部会自动处理畸变校正和主点偏移
-                        roll_raw, pitch_raw = self.pixel_to_angle(pixel_x, pixel_y, aim_x, aim_y)
+                            # 像素坐标转换为云台误差角（弧度）
+                            # 内部会自动处理畸变校正和主点偏移
+                            roll_raw, pitch_raw = self.pixel_to_angle(pixel_x, pixel_y, aim_x, aim_y)
                         
-                        # 转换为角度制
-                        import math
-                        roll_deg_raw = math.degrees(roll_raw)
-                        pitch_deg_raw = math.degrees(pitch_raw)
+                            # 转换为角度制
+                            import math
+                            roll_deg_raw = math.degrees(roll_raw)
+                            pitch_deg_raw = math.degrees(pitch_raw)
                         
-                        # 使用滤波器平滑角度输出（防止云台抖动）
-                        # 根据配置：卡尔曼预测滤波器或EMA滤波器
-                        pitch_deg_filtered, roll_deg_filtered = self.angle_filter.update(
-                            pitch_deg_raw, roll_deg_raw
-                        )
+                            # 使用滤波器平滑角度输出（防止云台抖动）
+                            # 根据配置：卡尔曼预测滤波器或EMA滤波器
+                            pitch_deg_filtered, roll_deg_filtered = self.angle_filter.update(
+                                pitch_deg_raw, roll_deg_raw
+                            )
                         
-                        # 转换回弧度用于发送
-                        roll_filtered = math.radians(roll_deg_filtered)
-                        pitch_filtered = math.radians(pitch_deg_filtered)
+                            # 转换回弧度用于发送
+                            roll_filtered = math.radians(roll_deg_filtered)
+                            pitch_filtered = math.radians(pitch_deg_filtered)
                         
-                        # 计算相对“补偿后瞄准点”的像素误差（用于显示）
-                        pixel_offset_x = pixel_x - aim_x
-                        pixel_offset_y = pixel_y - aim_y
+                            # 计算相对“补偿后瞄准点”的像素误差（用于显示）
+                            pixel_offset_x = pixel_x - aim_x
+                            pixel_offset_y = pixel_y - aim_y
                         
-                        # 发送云台控制角到下位机（使用滤波后的角度）
-                        self.send_gimbal_control(roll_filtered, pitch_filtered)
+                            # 发送云台控制角到下位机（使用滤波后的角度）
+                            self.send_gimbal_control(roll_filtered, pitch_filtered)
                         
-                        # 记录轨迹
-                        self.trajectory.append(center)
+                            # 记录轨迹
+                            self.trajectory.append(center)
                         
-                        # 保存显示数据供非检测帧使用
-                        self._display_data = {
-                            'pitch_deg_filtered': pitch_deg_filtered,
-                            'pitch_deg_raw': pitch_deg_raw,
-                            'roll_deg_filtered': roll_deg_filtered,
-                            'roll_deg_raw': roll_deg_raw,
-                            'pixel_offset_x': pixel_offset_x,
-                            'pixel_offset_y': pixel_offset_y,
-                            'aim_x': aim_x,
-                            'aim_y': aim_y
-                        }
+                            # 保存显示数据供非检测帧使用
+                            self._display_data = {
+                                'pitch_deg_filtered': pitch_deg_filtered,
+                                'pitch_deg_raw': pitch_deg_raw,
+                                'roll_deg_filtered': roll_deg_filtered,
+                                'roll_deg_raw': roll_deg_raw,
+                                'pixel_offset_x': pixel_offset_x,
+                                'pixel_offset_y': pixel_offset_y,
+                                'aim_x': aim_x,
+                                'aim_y': aim_y
+                            }
                     elif should_detect and skip_tracking_update:
                         # 扫描期间的重获确认阶段：保持扫描控制，暂不切回常规闭环
-                        if hasattr(self, '_display_data'):
-                            pitch_deg_filtered = self._display_data['pitch_deg_filtered']
-                            pitch_deg_raw = self._display_data['pitch_deg_raw']
-                            roll_deg_filtered = self._display_data['roll_deg_filtered']
-                            roll_deg_raw = self._display_data['roll_deg_raw']
-                            pixel_offset_x = self._display_data['pixel_offset_x']
-                            pixel_offset_y = self._display_data['pixel_offset_y']
-                            aim_x = self._display_data.get('aim_x', float(self.frame_center[0]))
-                            aim_y = self._display_data.get('aim_y', float(self.frame_center[1]))
-                        else:
-                            pitch_deg_filtered = pitch_deg_raw = 0
-                            roll_deg_filtered = roll_deg_raw = 0
-                            pixel_offset_x = pixel_offset_y = 0
-                            aim_x = float(self.frame_center[0])
-                            aim_y = float(self.frame_center[1])
+                        (pitch_deg_filtered, pitch_deg_raw,
+                         roll_deg_filtered, roll_deg_raw,
+                         pixel_offset_x, pixel_offset_y,
+                         aim_x, aim_y) = self._get_display_data_or_default()
                     else:
                         # 非检测帧：使用缓存的显示数据
-                        if hasattr(self, '_display_data'):
-                            pitch_deg_filtered = self._display_data['pitch_deg_filtered']
-                            pitch_deg_raw = self._display_data['pitch_deg_raw']
-                            roll_deg_filtered = self._display_data['roll_deg_filtered']
-                            roll_deg_raw = self._display_data['roll_deg_raw']
-                            pixel_offset_x = self._display_data['pixel_offset_x']
-                            pixel_offset_y = self._display_data['pixel_offset_y']
-                            aim_x = self._display_data.get('aim_x', float(self.frame_center[0]))
-                            aim_y = self._display_data.get('aim_y', float(self.frame_center[1]))
-
-                            # 检测间隔开启时，在非检测帧重发上一条命令，避免发送频率过低
-                            if self.hold_resend_enabled and not self.scan_active:
-                                now_hold = time.perf_counter()
-                                hold_dt = 1.0 / max(1.0, float(self.hold_resend_hz))
-                                if (now_hold - self._last_hold_resend_time) >= hold_dt:
-                                    try:
-                                        if self.enable_velocity_feedforward:
-                                            self.serial.send_pitch_yaw_velocity(
-                                                self.last_sent_pitch,
-                                                self.last_sent_roll,
-                                                0.0,
-                                                0.0
-                                            )
-                                        else:
-                                            self.serial.send_pitch_yaw(
-                                                self.last_sent_pitch,
-                                                self.last_sent_roll
-                                            )
-                                        self._last_hold_resend_time = now_hold
-                                    except Exception as e:
-                                        print(f"[串口重发] 失败: {e}")
-                        else:
-                            pitch_deg_filtered = pitch_deg_raw = 0
-                            roll_deg_filtered = roll_deg_raw = 0
-                            pixel_offset_x = pixel_offset_y = 0
-                            aim_x = float(self.frame_center[0])
-                            aim_y = float(self.frame_center[1])
+                        (pitch_deg_filtered, pitch_deg_raw,
+                         roll_deg_filtered, roll_deg_raw,
+                         pixel_offset_x, pixel_offset_y,
+                         aim_x, aim_y) = self._get_display_data_or_default()
+                        self._resend_hold_command_if_needed()
                     
-                    # 可视化 - 绘制检测框
-                    # 无人机框（第二层策略用，当前未启用）
-                    if laser_module.get('aerial_bbox') is not None:
-                        ax1, ay1, ax2, ay2 = laser_module['aerial_bbox']
-                        cv2.rectangle(frame, (ax1, ay1), (ax2, ay2), (255, 0, 0), 2)
-                        cv2.putText(frame, f"Aerial {laser_module['aerial_conf']:.2f}", 
-                                  (ax1, ay1-10), cv2.FONT_HERSHEY_SIMPLEX, 
-                                  0.5, (255, 0, 0), 4)
-                    
-                    # 绘制激光模块检测框（绿色）
-                    bbox = laser_module['bbox']
-                    cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), 
-                                (0, 255, 0), 4)
-                    
-                    # 显示激光模块标签
-                    detect_method = laser_module.get('detect_method', 'unknown')
-                    method_color = (0, 255, 0) if detect_method == 'direct' else (255, 165, 0)
-                    cv2.putText(frame, "laser_module", 
-                              (bbox[0], bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 
-                              0.6, method_color, 2)
-                    
-                    # # 激光模块中心点（红色）
-                    # cv2.circle(frame, center, 5, (0, 0, 255), -1)
-                    
-                    # # 绘制轨迹
-                    # for i in range(1, len(self.trajectory)):
-                    #     cv2.line(frame, self.trajectory[i-1], self.trajectory[i], 
-                    #            (0, 255, 255), 2)
-                    
-                    # 显示控制信息（角度制）- 显示原始和滤波后的角度
-                    cv2.putText(frame, f"Pitch: {pitch_deg_filtered:.2f}deg (raw:{pitch_deg_raw:.2f})", 
-                              (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                              (0, 255, 255), 2)
-                    cv2.putText(frame, f"Roll: {roll_deg_filtered:.2f}deg (raw:{roll_deg_raw:.2f})", 
-                              (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                              (0, 255, 255), 2)
-                    cv2.putText(frame, f"Offset: ({pixel_offset_x:.0f}, {pixel_offset_y:.0f})", 
-                              (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                              (150, 150, 150), 2)
-                    cv2.putText(frame, f"Conf: {laser_module['conf']:.2f}", 
-                              (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, 
-                              (0, 255, 255), 2)
+                    self._draw_detection_overlay(
+                        frame,
+                        laser_module,
+                        pitch_deg_filtered,
+                        pitch_deg_raw,
+                        roll_deg_filtered,
+                        roll_deg_raw,
+                        pixel_offset_x,
+                        pixel_offset_y
+                    )
                 else:
                     if should_detect:
+                        self._pending_target_center = None
+                        self._pending_target_count = 0
                         self.target_lost_frames += 1
 
                         if self.scan_enabled and self.target_lost_frames >= max(1, int(self.scan_enter_lost_frames)):
@@ -1563,70 +1521,11 @@ class AerialTrackingSystem:
                 
                 self.total_frames += 1
 
-                aim_draw = (
-                    int(round(self.frame_center[0] + self.aim_pixel_offset[0])),
-                    int(round(self.frame_center[1] + self.aim_pixel_offset[1]))
-                )
-                
-                # 画面中心十字线（白色）
-                cv2.line(frame, (self.frame_center[0]-20, self.frame_center[1]), 
-                    (self.frame_center[0]+20, self.frame_center[1]), (255, 255, 255), 2)
-                cv2.line(frame, (self.frame_center[0], self.frame_center[1]-20), 
-                    (self.frame_center[0], self.frame_center[1]+20), (255, 255, 255), 2)
-                cv2.circle(frame, self.frame_center, 3, (255, 255, 255), -1)
-
-                # 补偿后瞄准点（青色十字）与死区圈
-                cv2.drawMarker(frame, aim_draw, (255, 255, 0), markerType=cv2.MARKER_CROSS,
-                               markerSize=24, thickness=2)
-                if self.deadzone_enabled:
-                    cv2.circle(frame, aim_draw, int(self.deadzone_visual_radius),
-                               (0, 255, 0), 2)
-                
-                # 计算FPS
-                current_time = time.time()
-                self.fps = 1 / (current_time - self.fps_time)
-                self.fps_time = current_time
-                
-                # 显示性能信息
-                cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 150), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f"Detect: {self.detect_time*1000:.1f}ms", (10, 180), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 210), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # 显示滤波器类型
-                cv2.putText(frame, f"Filter: Kalman-Pred", (10, 240), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                
-                # 显示云台绝对姿态
-                pose_pitch, pose_roll = self.gimbal_pose.get_pose()
-                cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 270),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
-                
-                # 显示
-                cv2.imshow('Laser Module Tracking System', frame)
+                self._draw_common_overlay(frame)
                 
                 # 按键控制
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    print("用户按下 'q'，退出程序")
-                    break
-                elif key == ord('a'):
-                    # 调整滤波器参数（增加平滑度）
-                    # 卡尔曼滤波器：降低过程噪声（更信任预测）
-                    current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                    new_pn = max(1e-5, current_pn * 0.8)
-                    self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
-                    print(f"✓ 卡尔曼过程噪声降低为 {new_pn:.2e} (更平滑)")
-                elif key == ord('s'):
-                    # 调整滤波器参数（增加响应速度）
-                    # 卡尔曼滤波器：提高过程噪声（更信任测量）
-                    current_pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                    new_pn = min(1.0, current_pn * 1.2)
-                    self.angle_filter.kf.processNoiseCov = np.eye(4, dtype=np.float32) * new_pn
-                    print(f"✓ 卡尔曼过程噪声提高为 {new_pn:.2e} (响应更快)")
-                elif key == ord('k'):
+                if key == ord('k'):
                     # 减小卡尔曼预测时间
                     current_time = self.angle_filter.get_prediction_time_ms()
                     new_time = max(0, current_time - 20)
@@ -1638,105 +1537,6 @@ class AerialTrackingSystem:
                     new_time = min(500, current_time + 20)
                     self.angle_filter.set_prediction_time_ms(new_time)
                     print(f"✓ 预测时间增大为 {new_time:.0f}ms")
-                elif key == ord('m'):
-                    # 重置云台姿态记录器
-                    self.gimbal_pose.reset()
-                    self.angle_filter.reset()
-                    print("✓ 云台姿态记录器和滤波器已重置")
-                    print("  当前姿态视为新的初始位置")
-                elif key == ord('p'):
-                    # 显示当前系统参数
-                    params = self.camera.get_camera_params()
-                    if params:
-                        print("\n=== 当前系统参数 ===")
-                        print(f"曝光时间: {params['exposure_time']:.1f} μs (范围: {params['exposure_min']:.0f}-{params['exposure_max']:.0f})")
-                        print(f"增益: {params['gain']:.1f} dB (范围: {params['gain_min']:.1f}-{params['gain_max']:.1f})")
-
-                        # 滤波器参数
-                        print(f"滤波器: 卡尔曼预测滤波器")
-                        print(f"  预测时间: {self.angle_filter.get_prediction_time_ms():.0f}ms")
-                        pn = self.angle_filter.kf.processNoiseCov[0, 0]
-                        mn = self.angle_filter.kf.measurementNoiseCov[0, 0]
-                        print(f"  过程噪声: {pn:.2e}, 测量噪声: {mn:.2e}")
-                        v_pitch, v_roll = self.angle_filter.get_velocity()
-                        print(f"  当前速度: pitch={v_pitch:.2f}°/s, roll={v_roll:.2f}°/s")
-
-                        print(f"死区控制: {'启用' if self.deadzone_enabled else '禁用'}")
-                        print(f"  Pitch死区: {self.deadzone_pitch:.2f}°")
-                        print(f"  Roll死区: {self.deadzone_roll:.2f}°")
-                        print(f"  Pitch迟滞退出倍率: {self.pitch_deadzone_exit_ratio:.2f}x")
-                        print(f"  跳过发送次数: {self.deadzone_skip_count}")
-                        print(f"帧间隔控制: {'启用' if self.interval_enabled else '禁用'}")
-                        print(f"  检测间隔: 每{self.frame_interval}帧")
-                        print(f"控制律: PD")
-                        print(f"  Kp: pitch={self.control_gain_pitch:.2f}, roll={self.control_gain_roll:.2f}")
-                        print(f"  Kd: pitch={self.control_kd_pitch:.2f}, roll={self.control_kd_roll:.2f} (D-alpha={self.control_d_alpha:.2f})")
-                        print(f"  步长限制: pitch={self.max_step_deg_pitch:.2f}°, roll={self.max_step_deg_roll:.2f}°")
-                        print(f"  命令平滑: pitch={self.command_smooth_pitch:.2f}, roll={self.command_smooth_roll:.2f}")
-                        print(f"  Pitch换向抑制: {self.pitch_reversal_damping:.2f} (窗口={self.pitch_reversal_window_deg:.2f}°)")
-                        print(f"  非检测帧重发: {'启用' if self.hold_resend_enabled else '禁用'} @ {self.hold_resend_hz:.1f}Hz")
-                        print(f"扫描模式: {'启用' if self.scan_enabled else '禁用'} ({self.scan_pattern})")
-                        print(f"  进入阈值: lost>={self.scan_enter_lost_frames} 检测帧")
-                        print(f"  重获确认: {self.scan_reacq_confirm_frames} 帧")
-                        if str(self.scan_pattern).lower() == 'spiral':
-                            print(f"  spiral: spacing={self.scan_spiral_spacing_deg:.2f}°, speed={self.scan_spiral_speed_deg_s:.2f}°/s, r_max={self.scan_spiral_r_max_deg:.2f}°")
-                            print(f"  scan_scale: k_roll={self.scan_k_roll:.2f}, k_pitch={self.scan_k_pitch:.2f}, return={self.scan_spiral_return}")
-                        else:
-                            print(f"  circle: radius={self.scan_radius_deg:.2f}°, rate={self.scan_rate_hz:.2f}Hz")
-                            print(f"  scan_scale: k_roll={self.scan_k_roll:.2f}, k_pitch={self.scan_k_pitch:.2f}")
-                        print(f"像素补偿: dx={self.aim_pixel_offset[0]:.1f}px, dy={self.aim_pixel_offset[1]:.1f}px")
-                        print(f"相机线程: {'启用' if self.use_camera_thread else '禁用'}")
-                        if self.use_camera_thread:
-                            frame_cnt = self.camera.get_frame_count()
-                            print(f"  线程采集帧数: {frame_cnt}")
-                        print("==================")
-                elif key == ord('t'):
-                    # 切换相机线程模式
-                    self.use_camera_thread = not self.use_camera_thread
-                    self.camera.enable_thread = self.use_camera_thread
-                    if self.use_camera_thread:
-                        # 重启线程
-                        if not self.camera.thread.is_alive():
-                            self.camera.stopped = False
-                            self.camera.thread = threading.Thread(target=self.camera._update_loop, daemon=True)
-                            self.camera.thread.start()
-                        print("✓ 相机独立线程已启用")
-                    else:
-                        # 停止线程
-                        self.camera.stopped = True
-                        print("✓ 相机独立线程已禁用（切换到同步模式）")
-                elif key == ord('o'):
-                    # 手动切换失锁扫描开关
-                    self.scan_enabled = not self.scan_enabled
-                    if not self.scan_enabled:
-                        self._stop_scan("manual_off")
-                    print(f"✓ 扫描模式已{'启用' if self.scan_enabled else '禁用'}")
-                elif key == ord('z'):
-                    # 减小死区阈值
-                    self.deadzone_pitch = max(0.02, self.deadzone_pitch - 0.02)
-                    self.deadzone_roll = max(0.02, self.deadzone_roll - 0.02)
-                    print(f"✓ 死区阈值减小: pitch={self.deadzone_pitch:.2f}°, roll={self.deadzone_roll:.2f}°")
-                elif key == ord('x'):
-                    # 增大死区阈值
-                    self.deadzone_pitch = min(1.0, self.deadzone_pitch + 0.02)
-                    self.deadzone_roll = min(1.0, self.deadzone_roll + 0.02)
-                    print(f"✓ 死区阈值增大: pitch={self.deadzone_pitch:.2f}°, roll={self.deadzone_roll:.2f}°")
-                elif key == ord('+') or key == ord('='):
-                    # 增加曝光时间
-                    new_exposure = self.camera.exposure_time * 1.2
-                    self.camera.set_camera_params(exposure_time=new_exposure)
-                elif key == ord('-') or key == ord('_'):
-                    # 减少曝光时间
-                    new_exposure = self.camera.exposure_time * 0.8
-                    self.camera.set_camera_params(exposure_time=new_exposure)
-                elif key == ord('['):
-                    # 减少增益
-                    new_gain = max(0, self.camera.gain - 1.0)
-                    self.camera.set_camera_params(gain=new_gain)
-                elif key == ord(']'):
-                    # 增加增益
-                    new_gain = min(24, self.camera.gain + 1.0)
-                    self.camera.set_camera_params(gain=new_gain)
                     
         except KeyboardInterrupt:
             print("\n用户中断 (Ctrl+C)")
@@ -1764,19 +1564,34 @@ if __name__ == "__main__":
     import numpy as np
     import yaml
 
+    def _resolve_path(path_value):
+        if path_value is None:
+            return None
+        path_str = str(path_value)
+        if os.path.isabs(path_str):
+            return path_str
+        candidate_current = os.path.join(CURRENT_DIR, path_str)
+        if os.path.exists(candidate_current):
+            return candidate_current
+        candidate_root = os.path.join(PROJECT_ROOT, path_str)
+        if os.path.exists(candidate_root):
+            return candidate_root
+        return candidate_root
+
     # 从 config_tracking.yaml 读取配置
+    config_path = os.path.join(CURRENT_DIR, "config_tracking.yaml")
     try:
-        with open("config_tracking.yaml", 'r', encoding='utf-8') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
     except FileNotFoundError:
-        print("⚠️  未找到 config_tracking.yaml，使用默认参数")
+        print(f"⚠️  未找到配置文件: {config_path}，使用默认参数")
         config = {}
 
     # 配置参数 ===========================
     # 单模型模式：不需要车辆模型
     VEHICLE_MODEL = config.get('models', {}).get('vehicle', None)
-    ARMOR_MODEL = config.get('models', {}).get('armor', 'best.pt')
-    LASER_DATA_YAML = config.get('models', {}).get('data_yaml', 'data2_laser.yaml')
+    ARMOR_MODEL = _resolve_path(config.get('models', {}).get('armor', 'best.pt'))
+    LASER_DATA_YAML = _resolve_path(config.get('models', {}).get('data_yaml', 'data2_laser.yaml'))
 
     # 检测器参数（来自 detector.armor）
     detector_cfg = config.get('detector', {})
@@ -1789,9 +1604,14 @@ if __name__ == "__main__":
     LASER_IOU_THRES = float(armor_det_cfg.get('iou_thres', 0.45))
     LASER_MAX_DET = int(armor_det_cfg.get('max_det', 1))
 
-    SERIAL_PORT = config.get('serial', {}).get('port', 'COM8')
-    BAUDRATE = config.get('serial', {}).get('baudrate', 115200)
-    ENABLE_VELOCITY_FEEDFORWARD = config.get('serial', {}).get('enable_velocity_feedforward', True)
+    serial_cfg = config.get('serial', {})
+    SERIAL_PORT = serial_cfg.get('port', 'COM8')
+    BAUDRATE = serial_cfg.get('baudrate', 115200)
+    ENABLE_VELOCITY_FEEDFORWARD = serial_cfg.get('enable_velocity_feedforward', True)
+    SERIAL_PROTOCOL = str(serial_cfg.get('protocol', 'raw')).lower()
+    SERIAL_ENABLE_FEEDBACK = bool(serial_cfg.get('enable_feedback', False))
+    SERIAL_FEEDBACK_TIMEOUT_MS = float(serial_cfg.get('feedback_timeout_ms', 200.0))
+
     USE_GPU = config.get('gpu', {}).get('enable', False)
 
     # ========== 相机采集参数 ==========
@@ -1827,7 +1647,7 @@ if __name__ == "__main__":
 
     # 从标定文件加载
     USE_CALIBRATION_FILE = calib_cfg.get('use_file', False)
-    CALIBRATION_FILE = calib_cfg.get('file_path', 'camera_params.npz')
+    CALIBRATION_FILE = _resolve_path(calib_cfg.get('file_path', 'camera_params.npz'))
 
     if USE_CALIBRATION_FILE:
         try:
@@ -1848,7 +1668,8 @@ if __name__ == "__main__":
     print(f"无人机检测模型: {'(未启用)' if not VEHICLE_MODEL else VEHICLE_MODEL}")
     print(f"激光模块检测模型: {ARMOR_MODEL}")
     print(f"数据集配置文件: {LASER_DATA_YAML}")
-    print(f"串口: {SERIAL_PORT} @ {BAUDRATE}")
+    print(f"串口: {SERIAL_PORT} @ {BAUDRATE} ({SERIAL_PROTOCOL})")
+    print(f"姿态回传: {'启用' if SERIAL_ENABLE_FEEDBACK else '禁用'} (timeout={SERIAL_FEEDBACK_TIMEOUT_MS:.0f}ms)")
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
     print(f"检测参数: img_size={LASER_IMG_SIZE}, conf={LASER_CONF_THRES}, iou={LASER_IOU_THRES}, max_det={LASER_MAX_DET}")
@@ -1865,6 +1686,9 @@ if __name__ == "__main__":
             laser_data_yaml=LASER_DATA_YAML,  # 数据集配置文件
             serial_port=SERIAL_PORT,
             baudrate=BAUDRATE,
+            serial_protocol=SERIAL_PROTOCOL,
+            serial_enable_feedback=SERIAL_ENABLE_FEEDBACK,
+            feedback_timeout_ms=SERIAL_FEEDBACK_TIMEOUT_MS,
             use_gpu=USE_GPU,
             camera_fx=CAMERA_FX,
             camera_fy=CAMERA_FY,
@@ -1911,13 +1735,8 @@ if __name__ == "__main__":
             tracker.frame_interval = fi_cfg['interval']
         
         # 应用相机线程设置
-        tracker.use_camera_thread = USE_CAMERA_THREAD
-        tracker.camera.enable_thread = USE_CAMERA_THREAD
-        if USE_CAMERA_THREAD and not tracker.camera.thread.is_alive():
-            # 如果线程未启动，重新启动
-            tracker.camera.thread = threading.Thread(target=tracker.camera._update_loop, daemon=True)
-            tracker.camera.thread.start()
-            print("✓ 相机独立线程已重启")
+        tracker.use_camera_thread = bool(USE_CAMERA_THREAD)
+        tracker.camera.set_thread_mode(tracker.use_camera_thread)
 
         # 从配置文件读取云台控制律参数（可选）
         gimbal_cfg = config.get('gimbal', {})
@@ -1927,12 +1746,6 @@ if __name__ == "__main__":
                 tracker.control_gain_pitch = float(ctrl_cfg['gain_pitch'])
             if 'gain_roll' in ctrl_cfg:
                 tracker.control_gain_roll = float(ctrl_cfg['gain_roll'])
-            if 'kd_pitch' in ctrl_cfg:
-                tracker.control_kd_pitch = float(ctrl_cfg['kd_pitch'])
-            if 'kd_roll' in ctrl_cfg:
-                tracker.control_kd_roll = float(ctrl_cfg['kd_roll'])
-            if 'd_alpha' in ctrl_cfg:
-                tracker.control_d_alpha = float(ctrl_cfg['d_alpha'])
             if 'max_step_deg_pitch' in ctrl_cfg:
                 tracker.max_step_deg_pitch = float(ctrl_cfg['max_step_deg_pitch'])
             if 'max_step_deg_roll' in ctrl_cfg:
@@ -1949,6 +1762,8 @@ if __name__ == "__main__":
                 tracker.hold_resend_enabled = bool(ctrl_cfg['hold_resend_enabled'])
             if 'hold_resend_hz' in ctrl_cfg:
                 tracker.hold_resend_hz = max(1.0, float(ctrl_cfg['hold_resend_hz']))
+            if 'use_feedback_state' in ctrl_cfg:
+                tracker.use_feedback_state = bool(ctrl_cfg['use_feedback_state'])
 
         # 从配置文件读取跟踪参数
         if isinstance(tracking_cfg, dict):
@@ -1956,6 +1771,10 @@ if __name__ == "__main__":
                 tracker.max_lost_frames = max(1, int(tracking_cfg['max_lost_frames']))
             if 'max_distance' in tracking_cfg:
                 tracker.max_target_jump_distance = max(10.0, float(tracking_cfg['max_distance']))
+            if 'switch_confirm_frames' in tracking_cfg:
+                tracker.target_switch_confirm_frames = max(1, int(tracking_cfg['switch_confirm_frames']))
+            if 'switch_consistency_px' in tracking_cfg:
+                tracker.target_switch_consistency_px = max(5.0, float(tracking_cfg['switch_consistency_px']))
 
         # 从配置文件读取失锁扫描参数
         if isinstance(scan_cfg, dict):
@@ -1991,20 +1810,7 @@ if __name__ == "__main__":
         print(f"✓ 像素补偿已应用: dx={tracker.aim_pixel_offset[0]:.1f}px, dy={tracker.aim_pixel_offset[1]:.1f}px")
         
         print("\n按键说明:")
-        print("  q - 退出程序")
-        print("  r - 重置跟踪状态")
-        print("  a/s - 降低/提高过程噪声（更平滑/响应更快）")
         print("  k/l - 减小/增大预测时间（±20ms）")
-        print("  d - 切换死区控制开关")
-        print("  z/x - 减小/增大死区阈值")
-        print("  m - 重置云台姿态记录（重新以当前为初始）")
-        print("  p - 显示当前系统参数")
-        print("  o - 手动切换扫描开关")
-        print("  t - 切换相机线程模式（异步/同步）")
-        print("  i - 切换帧间隔控制")
-        print("  ,/. - 减小/增大帧间隔")
-        print("  +/- - 增加/减少曝光时间")
-        print("  [/] - 减少/增加增益")
         print("="*60)
         
         # 显示初始相机参数

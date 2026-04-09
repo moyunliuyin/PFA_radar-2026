@@ -9,6 +9,9 @@ models:
 serial:
   port: 'COM8'
   baudrate: 115200
+  protocol: 'raw'              # raw=旧裸包；framed=帧头帧尾+校验
+  enable_feedback: false       # 是否解析下位机回传姿态（framed 模式下有效）
+  feedback_timeout_ms: 200.0   # 回传姿态有效期，超时则回退到 last_sent 基准
   enable_velocity_feedforward: false  # 禁用速度前馈：大目标运动慢，前馈只会引入超调
 
 # GPU配置
@@ -88,6 +91,7 @@ gimbal:
   control:
     gain_pitch: 0.37            # 适度提高→每帧修正35%误差（原28%收敛太慢）
     gain_roll: 0.43             # 适度提高→每帧修正43%误差（原35%收敛太慢）
+    use_feedback_state: false   # true=控制基准使用下位机回传姿态（需 serial.enable_feedback=true）
     max_step_deg_pitch: 3.3     # 放宽步长限制→大误差时允许更快修正
     max_step_deg_roll: 7.0      # 放宽步长限制→大误差时允许更快修正
     smooth_pitch: 0.72          # pitch命令平滑系数，减小上下抖动（越小越稳）
@@ -101,6 +105,8 @@ gimbal:
 tracking:
   max_lost_frames: 10           # 最大丢失帧数
   max_distance: 200             # 目标关联最大距离（像素）
+  switch_confirm_frames: 2      # 主目标切换需连续确认帧数（防单帧误检）
+  switch_consistency_px: 80     # 候选新目标帧间一致性阈值（像素）
 
 # 失锁主动扫描（不改下位机协议）
 scan:
