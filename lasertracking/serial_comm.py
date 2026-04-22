@@ -32,7 +32,7 @@
 角度模式：绝对角度（相对于程序启动时的初始姿态）
 速度模式：瞬时角速度（卡尔曼滤波器估计的当前角速度）
 
-【模式3：分帧协议（推荐上赛场）】
+【模式3：分帧协议】
 帧格式（23字节，小端序）：
 - byte0   : 帧头 0xCD
 - byte1-20: payload = struct.pack('<ffffI', pitch, roll, v_pitch, v_roll, timestamp_ms)

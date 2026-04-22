@@ -2,7 +2,9 @@
 # 模型路径
 models:
   aerial: 'lasertracking/aerial.pt' # 无人机检测模型（YOLO26n）
+  aerial_backend: 'yolo26'       # 无人机检测后端（固定yolo26）
   armor: 'best.pt'              # 激光检测模块训练权重
+  armor_backend: 'yolo26'        # 激光检测后端（固定yolo26）
   data_yaml: 'laser.yaml' # 激光模块数据集配置文件（nc=1, names: laser）
   aerial_class_name: 'item'      # 无人机类别名偏好；不匹配时自动回退最高置信度
   
@@ -33,10 +35,21 @@ calibration:
   cy: null                      # 主点y（null=图像中心）
   dist_coeffs: null             # 畸变系数 [k1,k2,p1,p2,k3]（null=无畸变）
   enable_undistort: true        # 是否启用畸变校正
-  
+
   # 从文件加载标定参数
   use_file: false               # 是否从文件加载
   file_path: 'camera_params.npz'
+
+  # 激光-相机同轴校准文件
+  # 优先级：boresight_file > 下方 pixel_offset；文件不存在/无效时自动回退。
+  boresight_file: 'lasertracking/calibration/boresight.yaml'
+
+  # 激光-相机基线（给 boresight_calibrator 的 parallax overlay + 离线 parallax_estimator 用）
+  # 如果只做单距离 boresight，这里可以留空；要启用视差检查时填上。
+  baseline:
+    bx: 0.02                    # 水平基线(米)，向右为正
+    by: 0.0                     # 垂直基线(米)，向下为正
+    z_ref: 30.0                 # boresight 所在距离(米)，0=不使用
 
 # 检测器参数
 detector:
@@ -51,6 +64,23 @@ detector:
     conf_thres: 0.60            # 置信度阈值
     iou_thres: 0.40             # NMS IOU阈值
     max_det: 1                  # 最大检测数（优先最高置信度）
+
+# 检测前曝光自适应（用于训练集与真实亮度域不一致场景）
+exposure_adapt:
+  enabled: true                # 总开关
+  adaptive: true               # 根据当前帧亮度自动调节gamma
+  gamma: 1.35                  # adaptive=false时使用固定gamma
+  target_brightness: 105.0     # 目标亮度（HSV-V均值）
+  max_gamma: 2.2               # 自适应gamma上限
+  clahe_clip: 2.2              # CLAHE对比度裁剪阈值
+  clahe_grid: 8                # CLAHE网格尺寸
+  auto_camera_enabled: true    # 自动调相机曝光/增益
+  auto_camera_interval_s: 0.35 # 相机参数更新周期（秒）
+  auto_camera_target_brightness: 112.0  # 相机闭环亮度目标
+  auto_camera_brightness_deadband: 5.0  # 亮度死区，避免参数抖动
+  auto_camera_exposure_step_ratio: 0.12 # 曝光单次调节比例（相对范围）
+  auto_camera_gain_step: 0.8   # 增益单次最大调节步长（dB）
+  auto_detector_enabled: true  # 难场景自动降低conf并放宽iou
 
 # ROI策略
 roi:
@@ -79,6 +109,8 @@ deadzone:
   pitch_exit_ratio: 1.25        # pitch死区迟滞退出倍率（>1可显著减小上下边界抖动）
 
 # 像素补偿：改变最终相机停留位置
+# 仅在 calibration.boresight_file 未生效时使用（回退值）。
+# 推荐：运行 lasertracking/boresight_calibrator.py 现场校准后，该字段会被自动同步更新。
 pixel_offset: [67.0, -200.0]    # 像素补偿(dx,dy)：激光点相对画面中心的固定偏差（右/下为正）
 
 # 帧间隔控制配置
@@ -97,6 +129,7 @@ gimbal:
     max_step_deg_roll: 7.0      # 放宽步长限制→大误差时允许更快修正
     smooth_pitch: 0.72          # pitch命令平滑系数，减小上下抖动（越小越稳）
     smooth_roll: 0.88           # roll可稍激进，兼顾响应
+    left_turn_limit_roll_deg: -10.0 # 左转限位：roll最小值（更负表示更向左）
     pitch_reversal_damping: 0.55 # pitch误差小范围换向时抑制系数，防止来回打舵
     pitch_reversal_window_deg: 1.30
     hold_resend_enabled: true   # 非检测帧重发上一条绝对角命令，提升链路稳定性

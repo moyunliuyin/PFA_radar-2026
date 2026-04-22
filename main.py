@@ -26,6 +26,7 @@ else:
 import cv2
 import numpy as np
 from detect_function import YOLOv5Detector
+from lasertracking.uav_detector_thread import UAVDetectorThread
 from RM_serial_py.ser_api import build_send_packet, receive_packet, Radar_decision, \
     build_data_decision, build_data_radar_all, generate_random_password
 import yaml
@@ -1179,6 +1180,42 @@ detector_next = YOLOv5Detector(weights_path_next, data='yaml/armor.yaml', conf_t
                                max_det=10,
                                ui=True)
 
+# 独立无人机检测线程（与主识别链路完全分离）
+uav_cfg = config.get('uav_thread', {}) if isinstance(config.get('uav_thread', {}), dict) else {}
+uav_detector = UAVDetectorThread(
+    enabled=bool(uav_cfg.get('enabled', False)),
+    model_path=str(uav_cfg.get('model_path', 'lasertracking/aerial.pt')),
+    img_size=tuple(uav_cfg.get('img_size', [960, 960])),
+    conf_thres=float(uav_cfg.get('conf_thres', 0.15)),
+    iou_thres=float(uav_cfg.get('iou_thres', 0.45)),
+    max_det=int(uav_cfg.get('max_det', 6)),
+    process_interval_s=float(uav_cfg.get('process_interval_s', 0.0)),
+    right_half_only=bool(uav_cfg.get('right_half_only', True)),
+    show_window=bool(uav_cfg.get('show_window', True)),
+    strict_yolo26=bool(uav_cfg.get('strict_yolo26', True)),
+    queue_size=int(uav_cfg.get('queue_size', 2)),
+    exposure_adapt={
+        'enabled': bool(uav_cfg.get('exposure_adapt', {}).get('enabled', True)),
+        'adaptive': bool(uav_cfg.get('exposure_adapt', {}).get('adaptive', True)),
+        'gamma': float(uav_cfg.get('exposure_adapt', {}).get('gamma', 1.35)),
+        'target_brightness': float(uav_cfg.get('exposure_adapt', {}).get('target_brightness', 108.0)),
+        'max_gamma': float(uav_cfg.get('exposure_adapt', {}).get('max_gamma', 2.2)),
+        'clahe_clip': float(uav_cfg.get('exposure_adapt', {}).get('clahe_clip', 2.2)),
+        'clahe_grid': int(uav_cfg.get('exposure_adapt', {}).get('clahe_grid', 8)),
+    }
+)
+uav_detector.start()
+uav_window_name = 'uav_detect_right_half'
+uav_window_size = tuple(uav_cfg.get('display_size', config.get('ui', {}).get('img_display_size', [980, 700])))
+uav_window_size = (int(uav_window_size[0]), int(uav_window_size[1])) if len(uav_window_size) >= 2 else tuple(config['ui']['img_display_size'])
+if uav_detector.enabled:
+    print("已启用独立无人机识别线程（仅检测右半边，软件曝光自适应）")
+    if uav_detector.show_window:
+        cv2.namedWindow(uav_window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(uav_window_name, uav_window_size[0], uav_window_size[1])
+else:
+    print("独立无人机识别线程未启用")
+
 # 串口接收线程
 if config['global']['use_serial']:
     thread_receive = threading.Thread(target=ser_receive, daemon=True)
@@ -1238,6 +1275,8 @@ while True:
     map = map_backup.copy()
     det_time = 0
     img0 = camera_image.copy()
+    uav_source_frame = img0.copy()
+    uav_detector.submit_frame(uav_source_frame)
     ts = time.time()
     # 第一层神经网络识别
     result0 = detector.predict(img0)
@@ -1459,6 +1498,11 @@ while True:
         cv2.imshow('map_compare', map_compare_show)
     img0 = cv2.resize(img0, tuple(config['ui']['img_display_size']))
     cv2.imshow('img', img0)
+    if uav_detector.enabled and uav_detector.show_window:
+        uav_view = uav_detector.get_visualization(uav_source_frame)
+        if uav_view is not None:
+            uav_view_show = uav_detector.resize_for_display(uav_view, uav_window_size)
+            cv2.imshow(uav_window_name, uav_view_show)
     if save_img:
         img_name1 = "save_img/game1/1/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
         img_name2 = "save_img/game1/2/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"

@@ -32,7 +32,7 @@ filter:
     measurement_noise: 1e-1
 
 filter_compare:
-  enabled: true  # true时启用影子对比滤波，不参与串口发送
+  enabled: false  # true时启用影子对比滤波，不参与串口发送
   compare_type: 'hybrid_gated_kalman'  # auto/sliding_window/hybrid_gated_kalman
   draw_on_map: true
   show_delta_text: true
@@ -51,6 +51,28 @@ paths:
   models:
     car: 'models/car.pt'
     armor: 'models/armor.pt'
+
+uav_thread:
+  enabled: true
+  model_path: 'lasertracking/aerial.pt'
+  img_size: [960, 960]
+  conf_thres: 0.10
+  iou_thres: 0.45
+  max_det: 6
+  process_interval_s: 0.0
+  queue_size: 2
+  right_half_only: true
+  show_window: true
+  strict_yolo26: true
+  display_size: [980, 700]
+  exposure_adapt:
+    enabled: true
+    adaptive: true
+    gamma: 1.35
+    target_brightness: 120.0
+    max_gamma: 2.2
+    clahe_clip: 2.2
+    clahe_grid: 8
 
 camera_params:
   exposure_time: 16000.0 # 曝光时间

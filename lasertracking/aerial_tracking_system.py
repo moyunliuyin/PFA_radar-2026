@@ -20,9 +20,6 @@ from serial_comm import create_serial
 # 导入线程化相机包装器
 from camera_thread import ThreadedCamera
 
-# 导入YOLO检测器
-from detect_function import YOLOv5Detector
-
 # 导入海康相机接口
 try:
     mvimport_path = os.path.join(PROJECT_ROOT, "MvImport")
@@ -32,6 +29,89 @@ try:
 except ImportError:
     print("请确保海康相机SDK已正确安装")
     sys.exit(1)
+
+
+class AerialDetectorAdapter:
+    """yolo26检测适配器（ultralytics后端）。"""
+
+    def __init__(self,
+                 weights_path,
+                 img_size=(640, 640),
+                 conf_thres=0.15,
+                 iou_thres=0.45,
+                 max_det=6,
+                 device='cpu',
+                 classes=None,
+                 data=None,
+                 ui=False,
+                 backend='yolo26'):
+        self.weights_path = weights_path
+        self.img_size = img_size
+        self.conf_thres = float(conf_thres)
+        self.iou_thres = float(iou_thres)
+        self.max_det = int(max_det)
+        self.device = str(device)
+        self.classes = classes
+        self.data = data
+        self.ui = bool(ui)
+        self.backend = str(backend or 'yolo26').lower()
+        self.backend_name = 'none'
+        self.detector = None
+
+        self._init_backend()
+
+    def _init_backend(self):
+        if self.backend not in ('yolo26', 'ultralytics'):
+            raise ValueError(f"仅支持yolo26后端，当前backend={self.backend}")
+        try:
+            from ultralytics import YOLO
+            self.detector = YOLO(self.weights_path)
+            self.backend_name = 'yolo26'
+        except Exception as e:
+            raise RuntimeError(f"yolo26后端初始化失败: {e}")
+
+    @staticmethod
+    def _to_numpy(value):
+        if hasattr(value, 'detach'):
+            value = value.detach()
+        if hasattr(value, 'cpu'):
+            value = value.cpu()
+        if hasattr(value, 'numpy'):
+            return value.numpy()
+        return np.asarray(value)
+
+    def predict(self, image):
+        imgsz = max(int(self.img_size[0]), int(self.img_size[1])) if isinstance(self.img_size, (list, tuple)) else int(self.img_size)
+        results = self.detector.predict(
+            source=image,
+            conf=self.conf_thres,
+            iou=self.iou_thres,
+            imgsz=imgsz,
+            max_det=self.max_det,
+            classes=self.classes,
+            device=self.device,
+            verbose=False
+        )
+
+        detections = []
+        for result in results:
+            boxes = getattr(result, 'boxes', None)
+            if boxes is None:
+                continue
+            xyxy = self._to_numpy(boxes.xyxy)
+            confs = self._to_numpy(boxes.conf)
+            clses = self._to_numpy(boxes.cls).astype(int)
+            names = getattr(result, 'names', {}) or {}
+
+            for i in range(len(clses)):
+                x1, y1, x2, y2 = xyxy[i]
+                w = max(0.0, float(x2) - float(x1))
+                h = max(0.0, float(y2) - float(y1))
+                cls_id = int(clses[i])
+                cls_name = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(cls_id)
+                detections.append((str(cls_name), [int(x1), int(y1), int(w), int(h)], float(confs[i])))
+
+        return detections
 
 
 class PredictiveKalmanFilter:
@@ -445,6 +525,8 @@ class AerialTrackingSystem:
     """
     def __init__(self, aerial_model_path=None, laser_module_model_path=None,
                  aerial_class_name='item',
+                 aerial_backend='yolo26',
+                 laser_backend='yolo26',
                  laser_data_yaml='data2_laser.yaml',
                  serial_port='COM8', baudrate=115200,
                  serial_protocol='raw',
@@ -459,6 +541,20 @@ class AerialTrackingSystem:
                  laser_conf_thres=0.25,
                  laser_iou_thres=0.45,
                  laser_max_det=1,
+                 exposure_adapt_enabled=False,
+                 exposure_adapt_adaptive=True,
+                 exposure_adapt_gamma=1.35,
+                 exposure_adapt_target_brightness=105.0,
+                 exposure_adapt_max_gamma=2.2,
+                 exposure_adapt_clahe_clip=2.2,
+                 exposure_adapt_clahe_grid=8,
+                 auto_camera_enabled=True,
+                 auto_camera_interval_s=0.35,
+                 auto_camera_target_brightness=112.0,
+                 auto_camera_brightness_deadband=5.0,
+                 auto_camera_exposure_step_ratio=0.12,
+                 auto_camera_gain_step=0.8,
+                 auto_detector_enabled=True,
                  kalman_prediction_time_ms=200.0,
                  kalman_process_noise=1e-3,
                  kalman_measurement_noise=1e-1,
@@ -513,7 +609,7 @@ class AerialTrackingSystem:
         self.aerial_class_name = str(aerial_class_name or '').strip().lower()
         if aerial_model_path:
             try:
-                self.aerial_detector = YOLOv5Detector(
+                self.aerial_detector = AerialDetectorAdapter(
                     weights_path=aerial_model_path,
                     img_size=(640, 640),
                     conf_thres=0.15,
@@ -521,9 +617,11 @@ class AerialTrackingSystem:
                     max_det=6,
                     device=self.device_str,
                     classes=None,
+                    backend=aerial_backend,
                     ui=True
                 )
                 print(f"  无人机检测模型: {aerial_model_path}")
+                print(f"  无人机检测后端: {self.aerial_detector.backend_name}")
                 if self.aerial_class_name:
                     print(f"  无人机标签偏好: {self.aerial_class_name} (不匹配时回退最高置信度)")
             except Exception as e:
@@ -553,22 +651,62 @@ class AerialTrackingSystem:
         
         # 激光检测模块检测器（核心目标）
         # 使用 best.pt 训练权重 + data2_laser.yaml（单类 laser，class 0）
-        self.laser_module_detector = YOLOv5Detector(
+        self.laser_module_detector = AerialDetectorAdapter(
             weights_path=laser_module_model_path,
             img_size=laser_img_size,
             conf_thres=laser_conf_thres,
             iou_thres=laser_iou_thres,
             max_det=laser_max_det,
             device=self.device_str,
+            backend=laser_backend,
             data=laser_data_yaml,  # 使用 data2_laser.yaml（nc=1, laser class）
             classes=None,  # 检测所有类别（模型只有 laser 一类）
             ui=True
         )
+        self.base_laser_conf_thres = float(laser_conf_thres)
+        self.base_laser_iou_thres = float(laser_iou_thres)
+        self.base_aerial_conf_thres = 0.15
+        self.base_aerial_iou_thres = 0.45
         
         print(f"✓ 模型加载完成")
         print(f"  激光模块检测模型: {laser_module_model_path}")
+        print(f"  激光模块检测后端: {self.laser_module_detector.backend_name}")
         print(f"  数据集配置: {laser_data_yaml}")
         print(f"  检测参数: img_size={laser_img_size}, conf={laser_conf_thres}, iou={laser_iou_thres}, max_det={laser_max_det}")
+
+        # 检测前曝光自适应（用于亮度域偏移场景）
+        self.exposure_adapt_enabled = bool(exposure_adapt_enabled)
+        self.exposure_adapt_adaptive = bool(exposure_adapt_adaptive)
+        self.exposure_adapt_gamma = float(exposure_adapt_gamma)
+        self.exposure_adapt_target_brightness = float(exposure_adapt_target_brightness)
+        self.exposure_adapt_max_gamma = float(exposure_adapt_max_gamma)
+        self.exposure_adapt_clahe_clip = float(exposure_adapt_clahe_clip)
+        self.exposure_adapt_clahe_grid = max(2, int(exposure_adapt_clahe_grid))
+        self._gamma_lut_cache = {}
+        self.auto_camera_enabled = bool(auto_camera_enabled)
+        self.auto_camera_interval_s = max(0.10, float(auto_camera_interval_s))
+        self.auto_camera_target_brightness = float(auto_camera_target_brightness)
+        self.auto_camera_brightness_deadband = max(1.0, float(auto_camera_brightness_deadband))
+        self.auto_camera_exposure_step_ratio = max(0.02, min(0.5, float(auto_camera_exposure_step_ratio)))
+        self.auto_camera_gain_step = max(0.1, min(6.0, float(auto_camera_gain_step)))
+        self.auto_detector_enabled = bool(auto_detector_enabled)
+        self._last_auto_camera_update = 0.0
+        self.camera_exposure_min = 50.0
+        self.camera_exposure_max = 1000000.0
+        self.camera_gain_min = 0.0
+        self.camera_gain_max = 24.0
+
+        if self.exposure_adapt_enabled:
+            print("✓ 检测前曝光自适应: 启用")
+            print(f"  adaptive={self.exposure_adapt_adaptive}, gamma={self.exposure_adapt_gamma:.2f}, target_brightness={self.exposure_adapt_target_brightness:.1f}")
+            print(f"  max_gamma={self.exposure_adapt_max_gamma:.2f}, clahe_clip={self.exposure_adapt_clahe_clip:.2f}, clahe_grid={self.exposure_adapt_clahe_grid}")
+        else:
+            print("✓ 检测前曝光自适应: 禁用")
+        if self.auto_camera_enabled:
+            print(f"✓ 自动相机控制: 启用 (target={self.auto_camera_target_brightness:.1f}, interval={self.auto_camera_interval_s:.2f}s)")
+        else:
+            print("✓ 自动相机控制: 禁用")
+        print(f"✓ 自动检测阈值: {'启用' if self.auto_detector_enabled else '禁用'}")
         
         # 初始化海康相机
         print("初始化海康相机...")
@@ -581,6 +719,13 @@ class AerialTrackingSystem:
         # 包装为线程化相机（默认启用，可通过配置禁用）
         self.use_camera_thread = True  # 将从配置读取
         self.camera = ThreadedCamera(base_camera, enable_thread=self.use_camera_thread)
+
+        cam_info = self.camera.get_camera_params()
+        if isinstance(cam_info, dict):
+            self.camera_exposure_min = float(cam_info.get('exposure_min', self.camera_exposure_min))
+            self.camera_exposure_max = float(cam_info.get('exposure_max', self.camera_exposure_max))
+            self.camera_gain_min = float(cam_info.get('gain_min', self.camera_gain_min))
+            self.camera_gain_max = float(cam_info.get('gain_max', self.camera_gain_max))
         
         # 使用独立串口模块
         print(f"初始化串口通信...")
@@ -645,9 +790,11 @@ class AerialTrackingSystem:
         self.max_step_deg_roll = 3.0
         self.command_smooth_pitch = 0.72  # (0,1]，越小越平滑
         self.command_smooth_roll = 0.88
+        self.left_turn_limit_roll_deg = -10.0  # 临时左转限位：roll 不小于该值（负值表示向左）
         self.pitch_reversal_damping = 0.55   # 小误差换向时抑制pitch来回打舵
         self.pitch_reversal_window_deg = 1.3
         self._last_pitch_err_sign = 0
+        print(f"✓ 左转限位已启用 (roll >= {self.left_turn_limit_roll_deg:.1f}°)")
 
         # 非检测帧保持重发：不更新控制量，仅重发上一条绝对角命令
         self.hold_resend_enabled = False
@@ -669,6 +816,8 @@ class AerialTrackingSystem:
         # 画面中心
         self.frame_center = None
         self.aim_pixel_offset = (0.0, 0.0)  # (dx,dy) 相对画面中心的固定补偿
+        self.boresight_source = 'legacy'     # 'file' | 'legacy'
+        self.boresight_reference = None      # dict: {u_L, v_L, image_w, image_h}
         
         # FPS计算
         self.fps_time = time.time()
@@ -717,6 +866,133 @@ class AerialTrackingSystem:
         # 云台姿态记录器：维护相对于初始位置的绝对角度
         self.gimbal_pose = GimbalPoseRecorder()
         print("✓ 云台姿态记录器已启用（发送绝对角度）")
+
+    def _estimate_brightness(self, frame):
+        """使用HSV的V通道均值估计亮度。"""
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        return float(np.mean(hsv[:, :, 2]))
+
+    def _apply_gamma(self, frame, gamma):
+        """应用gamma映射，使用查找表缓存避免重复构造。"""
+        gamma = max(0.1, float(gamma))
+        gamma_key = round(gamma, 3)
+        table = self._gamma_lut_cache.get(gamma_key)
+        if table is None:
+            inv_gamma = 1.0 / gamma
+            table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+            self._gamma_lut_cache[gamma_key] = table
+        return cv2.LUT(frame, table)
+
+    def _enhance_frame_for_detection(self, frame):
+        """检测前亮度增强：CLAHE + 自适应gamma。"""
+        if not self.exposure_adapt_enabled:
+            return frame
+
+        enhanced = frame
+        v_channel = cv2.cvtColor(enhanced, cv2.COLOR_BGR2HSV)[:, :, 2]
+        v_mean = float(np.mean(v_channel))
+        v_std = float(np.std(v_channel))
+
+        clip_use = self.exposure_adapt_clahe_clip
+        if v_std < 26.0:
+            clip_use *= 1.20
+        elif v_std > 55.0:
+            clip_use *= 0.90
+        if v_mean > 165.0:
+            clip_use *= 0.90
+        clip_use = float(max(1.0, min(4.0, clip_use)))
+
+        lab = cv2.cvtColor(enhanced, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(
+            clipLimit=clip_use,
+            tileGridSize=(int(self.exposure_adapt_clahe_grid), int(self.exposure_adapt_clahe_grid))
+        )
+        l = clahe.apply(l)
+        enhanced = cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+
+        gamma_use = float(self.exposure_adapt_gamma)
+        if self.exposure_adapt_adaptive:
+            v = self._estimate_brightness(enhanced)
+            if v > 1.0:
+                gamma_use = min(
+                    float(self.exposure_adapt_max_gamma),
+                    max(1.0, float(self.exposure_adapt_target_brightness) / v)
+                )
+
+        return self._apply_gamma(enhanced, gamma_use)
+
+    def _update_detector_thresholds(self, brightness, contrast_std):
+        """困难光照场景下放宽检测阈值，优先召回。"""
+        if not self.auto_detector_enabled:
+            return
+
+        b = float(brightness)
+        c = float(contrast_std)
+        hard_factor = 0.0
+        if b < 90.0:
+            hard_factor += min(1.0, (90.0 - b) / 35.0)
+        elif b > 170.0:
+            hard_factor += min(1.0, (b - 170.0) / 40.0)
+        if c < 24.0:
+            hard_factor += min(1.0, (24.0 - c) / 12.0)
+        hard_factor = min(1.0, hard_factor)
+
+        laser_conf = self.base_laser_conf_thres - 0.08 * hard_factor
+        laser_iou = self.base_laser_iou_thres + 0.06 * hard_factor
+        self.laser_module_detector.conf_thres = float(max(0.08, min(0.9, laser_conf)))
+        self.laser_module_detector.iou_thres = float(max(0.25, min(0.75, laser_iou)))
+
+        if self.aerial_detector is not None:
+            aerial_conf = self.base_aerial_conf_thres - 0.05 * hard_factor
+            aerial_iou = self.base_aerial_iou_thres + 0.04 * hard_factor
+            self.aerial_detector.conf_thres = float(max(0.05, min(0.8, aerial_conf)))
+            self.aerial_detector.iou_thres = float(max(0.25, min(0.75, aerial_iou)))
+
+    def _auto_adjust_camera(self, frame):
+        """低频自动调曝光/增益：先曝光后增益，降亮时先减增益后减曝光。"""
+        if not self.auto_camera_enabled:
+            return
+
+        now = time.time()
+        if (now - self._last_auto_camera_update) < self.auto_camera_interval_s:
+            return
+
+        v = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
+        brightness = float(np.mean(v))
+        contrast_std = float(np.std(v))
+        self._update_detector_thresholds(brightness, contrast_std)
+
+        err = self.auto_camera_target_brightness - brightness
+        if abs(err) <= self.auto_camera_brightness_deadband:
+            self._last_auto_camera_update = now
+            return
+
+        cur_exp = float(self.camera.exposure_time)
+        cur_gain = float(self.camera.gain)
+
+        exp_span = max(1.0, self.camera_exposure_max - self.camera_exposure_min)
+        exp_step = max(200.0, exp_span * self.auto_camera_exposure_step_ratio * min(1.0, abs(err) / 45.0))
+        gain_step = max(0.1, self.auto_camera_gain_step * min(1.0, abs(err) / 45.0))
+
+        new_exp = cur_exp
+        new_gain = cur_gain
+
+        if err > 0:
+            if cur_exp < self.camera_exposure_max - 1.0:
+                new_exp = min(self.camera_exposure_max, cur_exp + exp_step)
+            elif cur_gain < self.camera_gain_max - 0.05:
+                new_gain = min(self.camera_gain_max, cur_gain + gain_step)
+        else:
+            if cur_gain > self.camera_gain_min + 0.05:
+                new_gain = max(self.camera_gain_min, cur_gain - gain_step)
+            elif cur_exp > self.camera_exposure_min + 1.0:
+                new_exp = max(self.camera_exposure_min, cur_exp - exp_step)
+
+        if abs(new_exp - cur_exp) > 1e-3 or abs(new_gain - cur_gain) > 1e-3:
+            self.camera.set_camera_params(exposure_time=new_exp, gain=new_gain)
+
+        self._last_auto_camera_update = now
 
     def _start_scan(self):
         if self.scan_active:
@@ -822,6 +1098,7 @@ class AerialTrackingSystem:
 
         pitch_cmd = base_pitch + self.command_smooth_pitch * (pitch_cmd - base_pitch)
         roll_cmd = base_roll + self.command_smooth_roll * (roll_cmd - base_roll)
+        roll_cmd = self._apply_left_turn_limit(roll_cmd)
 
         send_pitch = round(float(pitch_cmd), 2)
         send_roll = round(float(roll_cmd), 2)
@@ -857,6 +1134,13 @@ class AerialTrackingSystem:
                 d.get('aim_y', float(self.frame_center[1]))
             )
         return (0, 0, 0, 0, 0, 0, float(self.frame_center[0]), float(self.frame_center[1]))
+
+    def _apply_left_turn_limit(self, roll_deg):
+        """应用左转限位：限制 roll 最小值，防止继续向左越界。"""
+        limit = getattr(self, 'left_turn_limit_roll_deg', None)
+        if limit is None:
+            return float(roll_deg)
+        return max(float(limit), float(roll_deg))
 
     def _resend_hold_command_if_needed(self):
         """非检测帧重发上一条命令，避免发送频率过低。"""
@@ -952,6 +1236,12 @@ class AerialTrackingSystem:
         cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 270),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
+        bs_src = getattr(self, 'boresight_source', 'legacy')
+        bs_u = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
+        bs_v = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
+        cv2.putText(frame, f"Boresight u={bs_u:.0f} v={bs_v:.0f} [{bs_src}]",
+                    (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+
         cv2.imshow('Laser Module Tracking System', frame)
         
     def detect_laser_module(self, frame):
@@ -964,6 +1254,8 @@ class AerialTrackingSystem:
         当前使用apple class临时测试，未来替换为专用laser_module模型
         """
         detect_start = time.time()
+
+        detect_frame = self._enhance_frame_for_detection(frame)
         
         h, w = frame.shape[:2]
         if self.frame_center is None:
@@ -974,7 +1266,7 @@ class AerialTrackingSystem:
 
         if self.aerial_detector is not None:
             try:
-                aerial_results = self.aerial_detector.predict(frame)
+                aerial_results = self.aerial_detector.predict(detect_frame)
                 best_pref = None
                 best_any = None
 
@@ -1005,7 +1297,7 @@ class AerialTrackingSystem:
         
         # 策略1：直接全图检测激光模块（当前启用）
         try:
-            laser_results = self.laser_module_detector.predict(frame)
+            laser_results = self.laser_module_detector.predict(detect_frame)
             
             for detection in laser_results:
                 module_cls, module_xywh, module_conf = detection
@@ -1043,7 +1335,7 @@ class AerialTrackingSystem:
         # 若存在无人机框，优先在其ROI中搜索激光模块
         if best_aerial_bbox is not None:
             x1, y1, x2, y2 = best_aerial_bbox
-            roi = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+            roi = detect_frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
             if roi.size > 0:
                 try:
                     roi_results = self.laser_module_detector.predict(roi)
@@ -1081,7 +1373,7 @@ class AerialTrackingSystem:
             sy2 = min(h, search_y + search_size)
             
             if sx2 - sx1 >= 40 and sy2 - sy1 >= 40:
-                search_roi = frame[sy1:sy2, sx1:sx2]
+                search_roi = detect_frame[sy1:sy2, sx1:sx2]
                 module_results = self.laser_module_detector.predict(search_roi)
                 
                 for module_detection in module_results:
@@ -1239,6 +1531,7 @@ class AerialTrackingSystem:
         # 一阶平滑，降低检测离散和量化带来的命令抖动
         target_pitch = base_pitch + self.command_smooth_pitch * (target_pitch - base_pitch)
         target_roll = base_roll + self.command_smooth_roll * (target_roll - base_roll)
+        target_roll = self._apply_left_turn_limit(target_roll)
 
         send_pitch = round(float(target_pitch), 2)
         send_roll = round(float(target_roll), 2)
@@ -1404,6 +1697,8 @@ class AerialTrackingSystem:
                 if self.frame_center is None:
                     h, w = frame.shape[:2]
                     self.frame_center = (w // 2, h // 2)
+
+                self._auto_adjust_camera(frame)
                 
                 # 帧计数
                 self.frame_counter += 1
@@ -1673,6 +1968,8 @@ if __name__ == "__main__":
     ARMOR_MODEL = _resolve_path(config.get('models', {}).get('armor', 'best.pt'))
     LASER_DATA_YAML = _resolve_path(config.get('models', {}).get('data_yaml', 'data2_laser.yaml'))
     AERIAL_CLASS_NAME = str(config.get('models', {}).get('aerial_class_name', 'item'))
+    AERIAL_BACKEND = str(config.get('models', {}).get('aerial_backend', 'yolo26')).lower()
+    LASER_BACKEND = str(config.get('models', {}).get('armor_backend', 'yolo26')).lower()
 
     # 检测器参数（来自 detector.armor）
     detector_cfg = config.get('detector', {})
@@ -1684,6 +1981,23 @@ if __name__ == "__main__":
     LASER_CONF_THRES = float(armor_det_cfg.get('conf_thres', 0.25))
     LASER_IOU_THRES = float(armor_det_cfg.get('iou_thres', 0.45))
     LASER_MAX_DET = int(armor_det_cfg.get('max_det', 1))
+
+    # 检测前曝光自适应参数
+    exposure_cfg = config.get('exposure_adapt', {}) if isinstance(config, dict) else {}
+    EXPOSURE_ADAPT_ENABLED = bool(exposure_cfg.get('enabled', False))
+    EXPOSURE_ADAPT_ADAPTIVE = bool(exposure_cfg.get('adaptive', True))
+    EXPOSURE_ADAPT_GAMMA = float(exposure_cfg.get('gamma', 1.35))
+    EXPOSURE_ADAPT_TARGET_BRIGHTNESS = float(exposure_cfg.get('target_brightness', 105.0))
+    EXPOSURE_ADAPT_MAX_GAMMA = float(exposure_cfg.get('max_gamma', 2.2))
+    EXPOSURE_ADAPT_CLAHE_CLIP = float(exposure_cfg.get('clahe_clip', 2.2))
+    EXPOSURE_ADAPT_CLAHE_GRID = int(exposure_cfg.get('clahe_grid', 8))
+    AUTO_CAMERA_ENABLED = bool(exposure_cfg.get('auto_camera_enabled', True))
+    AUTO_CAMERA_INTERVAL_S = float(exposure_cfg.get('auto_camera_interval_s', 0.35))
+    AUTO_CAMERA_TARGET_BRIGHTNESS = float(exposure_cfg.get('auto_camera_target_brightness', 112.0))
+    AUTO_CAMERA_BRIGHTNESS_DEADBAND = float(exposure_cfg.get('auto_camera_brightness_deadband', 5.0))
+    AUTO_CAMERA_EXPOSURE_STEP_RATIO = float(exposure_cfg.get('auto_camera_exposure_step_ratio', 0.12))
+    AUTO_CAMERA_GAIN_STEP = float(exposure_cfg.get('auto_camera_gain_step', 0.8))
+    AUTO_DETECTOR_ENABLED = bool(exposure_cfg.get('auto_detector_enabled', True))
 
     serial_cfg = config.get('serial', {})
     SERIAL_PORT = serial_cfg.get('port', 'COM8')
@@ -1754,6 +2068,12 @@ if __name__ == "__main__":
     print(f"GPU加速: {'启用' if USE_GPU else '禁用'}")
     print(f"检测策略: 直接全图检测激光模块 (无人机ROI检测已关闭)")
     print(f"检测参数: img_size={LASER_IMG_SIZE}, conf={LASER_CONF_THRES}, iou={LASER_IOU_THRES}, max_det={LASER_MAX_DET}")
+    print(f"曝光自适应: {'启用' if EXPOSURE_ADAPT_ENABLED else '禁用'}")
+    if AUTO_CAMERA_ENABLED:
+        print(f"自动相机: 启用 (target={AUTO_CAMERA_TARGET_BRIGHTNESS:.1f}, interval={AUTO_CAMERA_INTERVAL_S:.2f}s)")
+    else:
+        print("自动相机: 禁用")
+    print(f"自动检测阈值: {'启用' if AUTO_DETECTOR_ENABLED else '禁用'}")
     print(f"滤波器: 卡尔曼预测滤波器 (预测时间={KALMAN_PREDICTION_TIME_MS}ms)")
     if isinstance(scan_cfg, dict):
         print(f"失锁扫描: {'启用' if scan_cfg.get('enabled', True) else '禁用'} ({scan_cfg.get('pattern', 'spiral')})")
@@ -1765,6 +2085,8 @@ if __name__ == "__main__":
             aerial_model_path=VEHICLE_MODEL,  # 无人机检测模型（未使用）
             laser_module_model_path=ARMOR_MODEL,  # 激光模块检测模型
             aerial_class_name=AERIAL_CLASS_NAME,
+            aerial_backend=AERIAL_BACKEND,
+            laser_backend=LASER_BACKEND,
             laser_data_yaml=LASER_DATA_YAML,  # 数据集配置文件
             serial_port=SERIAL_PORT,
             baudrate=BAUDRATE,
@@ -1784,6 +2106,20 @@ if __name__ == "__main__":
             laser_conf_thres=LASER_CONF_THRES,
             laser_iou_thres=LASER_IOU_THRES,
             laser_max_det=LASER_MAX_DET,
+            exposure_adapt_enabled=EXPOSURE_ADAPT_ENABLED,
+            exposure_adapt_adaptive=EXPOSURE_ADAPT_ADAPTIVE,
+            exposure_adapt_gamma=EXPOSURE_ADAPT_GAMMA,
+            exposure_adapt_target_brightness=EXPOSURE_ADAPT_TARGET_BRIGHTNESS,
+            exposure_adapt_max_gamma=EXPOSURE_ADAPT_MAX_GAMMA,
+            exposure_adapt_clahe_clip=EXPOSURE_ADAPT_CLAHE_CLIP,
+            exposure_adapt_clahe_grid=EXPOSURE_ADAPT_CLAHE_GRID,
+            auto_camera_enabled=AUTO_CAMERA_ENABLED,
+            auto_camera_interval_s=AUTO_CAMERA_INTERVAL_S,
+            auto_camera_target_brightness=AUTO_CAMERA_TARGET_BRIGHTNESS,
+            auto_camera_brightness_deadband=AUTO_CAMERA_BRIGHTNESS_DEADBAND,
+            auto_camera_exposure_step_ratio=AUTO_CAMERA_EXPOSURE_STEP_RATIO,
+            auto_camera_gain_step=AUTO_CAMERA_GAIN_STEP,
+            auto_detector_enabled=AUTO_DETECTOR_ENABLED,
             kalman_prediction_time_ms=KALMAN_PREDICTION_TIME_MS,
             kalman_process_noise=KALMAN_PROCESS_NOISE,
             kalman_measurement_noise=KALMAN_MEASUREMENT_NOISE,
@@ -1836,6 +2172,8 @@ if __name__ == "__main__":
                 tracker.command_smooth_pitch = min(1.0, max(0.05, float(ctrl_cfg['smooth_pitch'])))
             if 'smooth_roll' in ctrl_cfg:
                 tracker.command_smooth_roll = min(1.0, max(0.05, float(ctrl_cfg['smooth_roll'])))
+            if 'left_turn_limit_roll_deg' in ctrl_cfg:
+                tracker.left_turn_limit_roll_deg = float(ctrl_cfg['left_turn_limit_roll_deg'])
             if 'pitch_reversal_damping' in ctrl_cfg:
                 tracker.pitch_reversal_damping = min(1.0, max(0.1, float(ctrl_cfg['pitch_reversal_damping'])))
             if 'pitch_reversal_window_deg' in ctrl_cfg:
@@ -1885,11 +2223,64 @@ if __name__ == "__main__":
             if 'k_pitch' in scan_cfg:
                 tracker.scan_k_pitch = max(0.2, float(scan_cfg['k_pitch']))
 
-        # 像素补偿：激光点相对画面中心的固定偏差(dx,dy)
-        po_cfg = config.get('pixel_offset', [0.0, 0.0])
-        if isinstance(po_cfg, (list, tuple)) and len(po_cfg) >= 2:
-            tracker.aim_pixel_offset = (float(po_cfg[0]), float(po_cfg[1]))
-        print(f"✓ 像素补偿已应用: dx={tracker.aim_pixel_offset[0]:.1f}px, dy={tracker.aim_pixel_offset[1]:.1f}px")
+        # 像素补偿：优先级 boresight.yaml > pixel_offset
+        # boresight.yaml 存储激光点的绝对像素 (u_L, v_L)；运行时换算成相对画面中心的 dx/dy。
+        # 只要文件存在且字段齐全，就覆盖掉老字段 pixel_offset；否则回退到老流程。
+        boresight_loaded = False
+        boresight_file_cfg = calib_cfg.get('boresight_file')
+        if boresight_file_cfg:
+            boresight_path = _resolve_path(boresight_file_cfg)
+            if boresight_path and os.path.exists(boresight_path):
+                try:
+                    with open(boresight_path, 'r', encoding='utf-8') as _bsf:
+                        boresight_data = yaml.safe_load(_bsf) or {}
+                    if 'u_L' in boresight_data and 'v_L' in boresight_data:
+                        bs_u = float(boresight_data['u_L'])
+                        bs_v = float(boresight_data['v_L'])
+                        bs_w = int(boresight_data.get('image_w', 0) or 0)
+                        bs_h = int(boresight_data.get('image_h', 0) or 0)
+                        # 若保存时的图像尺寸与当前相机不同，按比例缩放（换镜头/裁剪兼容）
+                        probe_ret, probe_frame = tracker.camera.read()
+                        if probe_ret and probe_frame is not None:
+                            cur_h, cur_w = probe_frame.shape[:2]
+                        else:
+                            cur_w = bs_w if bs_w > 0 else 5472
+                            cur_h = bs_h if bs_h > 0 else 3648
+                        if bs_w > 0 and bs_h > 0 and (bs_w != cur_w or bs_h != cur_h):
+                            sx = cur_w / float(bs_w)
+                            sy = cur_h / float(bs_h)
+                            bs_u *= sx
+                            bs_v *= sy
+                            print(f"⚠️  boresight 图像尺寸 {bs_w}x{bs_h} ≠ 当前 {cur_w}x{cur_h}，已按比例缩放")
+                        dx = bs_u - cur_w * 0.5
+                        dy = bs_v - cur_h * 0.5
+                        tracker.aim_pixel_offset = (float(dx), float(dy))
+                        tracker.boresight_source = 'file'
+                        tracker.boresight_reference = {
+                            'u_L': bs_u, 'v_L': bs_v,
+                            'image_w': cur_w, 'image_h': cur_h,
+                            'path': boresight_path,
+                        }
+                        print(f"✓ Boresight 来源: file ({boresight_path})")
+                        print(f"  u_L={bs_u:.2f} v_L={bs_v:.2f} -> dx={dx:.1f}, dy={dy:.1f}")
+                        if 'z_ref' in boresight_data:
+                            print(f"  校准参考距离 z_ref={float(boresight_data['z_ref']):g} m")
+                        boresight_loaded = True
+                    else:
+                        print(f"⚠️  {boresight_path} 缺少 u_L/v_L，回退 pixel_offset")
+                except Exception as _bs_err:
+                    print(f"⚠️  读 boresight 失败: {_bs_err}，回退 pixel_offset")
+            else:
+                print(f"ℹ️  boresight 文件不存在: {boresight_file_cfg}，使用 pixel_offset")
+
+        if not boresight_loaded:
+            # 像素补偿：激光点相对画面中心的固定偏差(dx,dy)
+            po_cfg = config.get('pixel_offset', [0.0, 0.0])
+            if isinstance(po_cfg, (list, tuple)) and len(po_cfg) >= 2:
+                tracker.aim_pixel_offset = (float(po_cfg[0]), float(po_cfg[1]))
+            tracker.boresight_source = 'legacy'
+            print(f"✓ 像素补偿已应用 (legacy pixel_offset): "
+                  f"dx={tracker.aim_pixel_offset[0]:.1f}px, dy={tracker.aim_pixel_offset[1]:.1f}px")
         
         print("\n按键说明:")
         print("  k/l - 减小/增大预测时间（±20ms）")
