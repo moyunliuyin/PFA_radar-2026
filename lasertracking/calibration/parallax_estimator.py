@@ -31,7 +31,7 @@ import argparse
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import yaml
@@ -99,18 +99,44 @@ def _load_eps(node) -> Tuple[float, ...]:
     return DEFAULT_EPS_LIST
 
 
+def _coerce_float(data, key: str, default: float = 0.0) -> float:
+    try:
+        return float(data.get(key, default))
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _normalize_config_data(data: dict) -> dict:
+    calibration = data.get("calibration")
+    if isinstance(calibration, dict):
+        baseline = calibration.get("baseline", {}) or {}
+        merged = {
+            "fx": calibration.get("fx", data.get("fx", 0.0)),
+            "fy": calibration.get("fy", data.get("fy", 0.0)),
+            "bx": baseline.get("bx", data.get("bx", 0.0)),
+            "by": baseline.get("by", data.get("by", 0.0)),
+            "z_ref": baseline.get("z_ref", data.get("z_ref", 0.0)),
+            "z_min": data.get("z_min", 1.0),
+            "z_max": data.get("z_max", 50.0),
+            "step": data.get("step", 1.0),
+            "eps_list": data.get("eps_list"),
+        }
+        return merged
+    return data
+
+
 def load_config(path: str) -> ParallaxConfig:
     with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+        data = _normalize_config_data(yaml.safe_load(f) or {})
     cfg = ParallaxConfig(
-        fx=float(data.get("fx", 0.0)),
-        fy=float(data.get("fy", 0.0)),
-        bx=float(data.get("bx", 0.0)),
-        by=float(data.get("by", 0.0)),
-        z_min=float(data.get("z_min", 1.0)),
-        z_max=float(data.get("z_max", 50.0)),
-        z_ref=float(data.get("z_ref", 0.0)),
-        step=float(data.get("step", 1.0)),
+        fx=_coerce_float(data, "fx", 0.0),
+        fy=_coerce_float(data, "fy", 0.0),
+        bx=_coerce_float(data, "bx", 0.0),
+        by=_coerce_float(data, "by", 0.0),
+        z_min=_coerce_float(data, "z_min", 1.0),
+        z_max=_coerce_float(data, "z_max", 50.0),
+        z_ref=_coerce_float(data, "z_ref", 0.0),
+        step=_coerce_float(data, "step", 1.0),
         eps_list=_load_eps(data.get("eps_list")),
     )
     err = cfg.validate()

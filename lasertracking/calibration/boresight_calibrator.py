@@ -57,6 +57,8 @@
 from __future__ import annotations
 
 import argparse
+from ctypes import POINTER, byref, c_ubyte, cast, memset, sizeof
+import importlib
 import os
 import sys
 import threading
@@ -77,7 +79,6 @@ for p in (CURRENT_DIR, LASERTRACKING_DIR, PROJECT_ROOT):
         sys.path.append(p)
 
 # 复用既有类，避免重新实现相机和检测器
-from aerial_tracking_system import HikCameraCapture, AerialDetectorAdapter  # noqa: E402
 from camera_thread import ThreadedCamera  # noqa: E402
 from parallax_estimator import parallax_offset  # noqa: E402
 
@@ -89,6 +90,16 @@ ARROW_LEFT = (2424832, 65361, 81)
 ARROW_RIGHT = (2555904, 65363, 83)
 ARROW_UP = (2490368, 65362, 82)
 ARROW_DOWN = (2621440, 65364, 84)
+
+
+def _load_hik_sdk():
+    mvimport_path = os.path.join(PROJECT_ROOT, "MvImport")
+    if mvimport_path not in sys.path:
+        sys.path.append(mvimport_path)
+    try:
+        return importlib.import_module("MvImport.MvCameraControl_class")
+    except ImportError as exc:
+        raise RuntimeError("请确保海康相机 SDK 已正确安装，并且 MvImport 可导入") from exc
 
 
 def _resolve_path(path_value, *, base_dir=LASERTRACKING_DIR, root_dir=PROJECT_ROOT):
@@ -126,6 +137,169 @@ class MouseState:
         self.view_w = 0
         self.view_h = 0
         self.pending = False
+
+
+class HikCameraCapture:
+    def __init__(self, camera_index=0, exposure_time=55915.0, gain=10.5):
+        self.camera_index = int(camera_index)
+        self.exposure_time = exposure_time
+        self.gain = gain
+        self.sdk = None
+        self.cam = None
+        self.data_buf = None
+        self.nPayloadSize = None
+
+    def open(self):
+        self.sdk = _load_hik_sdk()
+        device_list = self.sdk.MV_CC_DEVICE_INFO_LIST()
+        tlayer_type = self.sdk.MV_GIGE_DEVICE | self.sdk.MV_USB_DEVICE
+        ret = self.sdk.MvCamera.MV_CC_EnumDevices(tlayer_type, device_list)
+        if ret != 0:
+            print(f"枚举设备失败! ret[0x{ret:x}]")
+            return False
+        if device_list.nDeviceNum == 0:
+            print("未找到设备!")
+            return False
+        if self.camera_index < 0 or self.camera_index >= device_list.nDeviceNum:
+            print(f"相机索引越界: index={self.camera_index}, devices={device_list.nDeviceNum}")
+            return False
+        print(f"找到 {device_list.nDeviceNum} 个设备")
+        self.cam = self.sdk.MvCamera()
+        st_device = cast(
+            device_list.pDeviceInfo[self.camera_index],
+            POINTER(self.sdk.MV_CC_DEVICE_INFO),
+        ).contents
+        ret = self.cam.MV_CC_CreateHandle(st_device)
+        if ret != 0:
+            print(f"创建句柄失败! ret[0x{ret:x}]")
+            return False
+        ret = self.cam.MV_CC_OpenDevice(self.sdk.MV_ACCESS_Exclusive, 0)
+        if ret != 0:
+            print(f"打开设备失败! ret[0x{ret:x}]")
+            self.cam.MV_CC_DestroyHandle()
+            self.cam = None
+            return False
+        ret = self.cam.MV_CC_SetEnumValue("TriggerMode", self.sdk.MV_TRIGGER_MODE_OFF)
+        if ret != 0:
+            print(f"设置触发模式失败! ret[0x{ret:x}]")
+        self.set_camera_params(self.exposure_time, self.gain)
+        st_param = self.sdk.MVCC_INTVALUE()
+        memset(byref(st_param), 0, sizeof(self.sdk.MVCC_INTVALUE))
+        ret = self.cam.MV_CC_GetIntValue("PayloadSize", st_param)
+        if ret != 0:
+            print(f"获取PayloadSize失败! ret[0x{ret:x}]")
+            self.release()
+            return False
+        self.nPayloadSize = int(st_param.nCurValue)
+        self.data_buf = (c_ubyte * self.nPayloadSize)()
+        ret = self.cam.MV_CC_StartGrabbing()
+        if ret != 0:
+            print(f"开始取流失败! ret[0x{ret:x}]")
+            self.release()
+            return False
+        print("相机打开成功!")
+        return True
+
+    def set_camera_params(self, exposure_time=None, gain=None):
+        if self.cam is None:
+            print("相机未初始化!")
+            return False
+        if exposure_time is not None:
+            ret = self.cam.MV_CC_SetFloatValue("ExposureTime", float(exposure_time))
+            if ret == 0:
+                self.exposure_time = exposure_time
+                print(f"✓ 设置曝光时间: {exposure_time} μs")
+            else:
+                print(f"⚠️ 设置曝光时间失败: 0x{ret:x}")
+        if gain is not None:
+            ret = self.cam.MV_CC_SetFloatValue("Gain", float(gain))
+            if ret == 0:
+                self.gain = gain
+                print(f"✓ 设置增益: {gain} dB")
+            else:
+                print(f"⚠️ 设置增益失败: 0x{ret:x}")
+        return True
+
+    def get_camera_params(self):
+        if self.cam is None:
+            print("相机未初始化!")
+            return None
+        params = {}
+        st_float = self.sdk.MVCC_FLOATVALUE()
+        memset(byref(st_float), 0, sizeof(self.sdk.MVCC_FLOATVALUE))
+        ret = self.cam.MV_CC_GetFloatValue("ExposureTime", st_float)
+        if ret == 0:
+            params["exposure_time"] = st_float.fCurValue
+            params["exposure_min"] = st_float.fMin
+            params["exposure_max"] = st_float.fMax
+        memset(byref(st_float), 0, sizeof(self.sdk.MVCC_FLOATVALUE))
+        ret = self.cam.MV_CC_GetFloatValue("Gain", st_float)
+        if ret == 0:
+            params["gain"] = st_float.fCurValue
+            params["gain_min"] = st_float.fMin
+            params["gain_max"] = st_float.fMax
+        return params
+
+    def read(self):
+        if self.cam is None or self.data_buf is None or self.nPayloadSize is None:
+            return False, None
+        st_frame_info = self.sdk.MV_FRAME_OUT_INFO_EX()
+        memset(byref(st_frame_info), 0, sizeof(st_frame_info))
+        ret = self.cam.MV_CC_GetOneFrameTimeout(
+            byref(self.data_buf),
+            self.nPayloadSize,
+            st_frame_info,
+            1000,
+        )
+        if ret != 0:
+            return False, None
+        frame = self.image_control(self.data_buf, st_frame_info)
+        if frame is None:
+            return False, None
+        return True, frame
+
+    def image_control(self, raw_buf, st_frame_info):
+        width = int(st_frame_info.nWidth)
+        height = int(st_frame_info.nHeight)
+        if st_frame_info.enPixelType == self.sdk.PixelType_Gvsp_BGR8_Packed:
+            size_bytes = width * height * 3
+            img = np.frombuffer(raw_buf, count=size_bytes, dtype=np.uint8)
+            return img.reshape(height, width, 3)
+        convert_param = self.sdk.MV_CC_PIXEL_CONVERT_PARAM()
+        memset(byref(convert_param), 0, sizeof(self.sdk.MV_CC_PIXEL_CONVERT_PARAM))
+        convert_param.nWidth = width
+        convert_param.nHeight = height
+        convert_param.pSrcData = cast(raw_buf, POINTER(c_ubyte))
+        convert_param.nSrcDataLen = st_frame_info.nFrameLen
+        convert_param.enSrcPixelType = st_frame_info.enPixelType
+        convert_param.enDstPixelType = self.sdk.PixelType_Gvsp_BGR8_Packed
+        dst_size = width * height * 3
+        dst_buf = (c_ubyte * dst_size)()
+        convert_param.pDstBuffer = cast(dst_buf, POINTER(c_ubyte))
+        convert_param.nDstBufferSize = dst_size
+        ret = self.cam.MV_CC_ConvertPixelType(convert_param)
+        if ret != 0:
+            print(f"像素格式转换失败 ret=0x{ret:x}")
+            return None
+        return np.frombuffer(dst_buf, count=dst_size, dtype=np.uint8).reshape(height, width, 3)
+
+    def release(self):
+        if self.cam is None:
+            return
+        try:
+            self.cam.MV_CC_StopGrabbing()
+        except Exception:
+            pass
+        try:
+            self.cam.MV_CC_CloseDevice()
+        except Exception:
+            pass
+        try:
+            self.cam.MV_CC_DestroyHandle()
+        except Exception:
+            pass
+        self.cam = None
+        print("相机已释放")
 
 
 def mouse_callback(event, x, y, flags, userdata):
@@ -174,19 +348,20 @@ def load_config(path: str) -> Dict:
 
 def build_camera(config: Dict) -> ThreadedCamera:
     cam_cfg = config.get("camera", {}) or {}
+    camera_index = int(cam_cfg.get("camera_index", 0) or 0)
     exposure = float(cam_cfg.get("exposure_time", 55915.0))
     gain = float(cam_cfg.get("gain", 10.5))
     use_thread = bool(cam_cfg.get("use_thread", True))
 
     base_camera = HikCameraCapture(
-        camera_index=0, exposure_time=exposure, gain=gain,
+        camera_index=camera_index, exposure_time=exposure, gain=gain,
     )
     if not base_camera.open():
         raise RuntimeError("海康相机打开失败，请检查设备连接/驱动/占用情况")
     return ThreadedCamera(base_camera, enable_thread=use_thread)
 
 
-def build_detector(config: Dict) -> Optional[AerialDetectorAdapter]:
+def build_detector(config: Dict):
     models = config.get("models", {}) or {}
     weights = _resolve_path(models.get("armor", "best.pt"))
     data_yaml = _resolve_path(models.get("data_yaml", "data2_laser.yaml"))
@@ -205,6 +380,7 @@ def build_detector(config: Dict) -> Optional[AerialDetectorAdapter]:
         device = "cpu"
 
     try:
+        from aerial_tracking_system import AerialDetectorAdapter  # noqa: WPS433
         return AerialDetectorAdapter(
             weights_path=weights,
             img_size=(int(img_size[0]), int(img_size[1])),
@@ -221,7 +397,7 @@ def build_detector(config: Dict) -> Optional[AerialDetectorAdapter]:
         return None
 
 
-def detect_best_target(detector: AerialDetectorAdapter,
+def detect_best_target(detector,
                        frame: np.ndarray) -> Optional[Tuple[Tuple[int, int, int, int],
                                                             Tuple[float, float],
                                                             float]]:
@@ -257,6 +433,41 @@ def read_intrinsics(config: Dict) -> Tuple[float, float]:
     fx = float(calib.get("fx", 0.0) or 0.0)
     fy = float(calib.get("fy", 0.0) or 0.0)
     return fx, fy
+
+
+def print_config_check(config: Dict, settings: CalibratorSettings) -> int:
+    print("=== boresight calibrator config check ===")
+    print(f"config: {settings.config_path} {'OK' if os.path.exists(settings.config_path) else 'MISSING'}")
+    print(f"output: {settings.output_path}")
+    output_dir = os.path.dirname(os.path.abspath(settings.output_path))
+    print(f"output_dir: {output_dir} {'OK' if os.path.isdir(output_dir) else 'WILL_CREATE'}")
+    calib = config.get("calibration", {}) or {}
+    boresight_cfg = calib.get("boresight_file")
+    if boresight_cfg:
+        boresight_path = _resolve_path(boresight_cfg)
+        print(f"boresight_file: {boresight_path} {'EXISTS' if boresight_path and os.path.exists(boresight_path) else 'NOT_EXISTS'}")
+    fx, fy = read_intrinsics(config)
+    bx, by, z_ref = read_baseline(config)
+    print(f"intrinsics: fx={fx:g} fy={fy:g} {'OK' if fx > 0.0 and fy > 0.0 else 'INVALID'}")
+    print(f"baseline: bx={bx:g} by={by:g} z_ref={z_ref:g}")
+    cam_cfg = config.get("camera", {}) or {}
+    print(
+        "camera: "
+        f"index={int(cam_cfg.get('camera_index', 0) or 0)} "
+        f"exposure={float(cam_cfg.get('exposure_time', 55915.0) or 55915.0):g} "
+        f"gain={float(cam_cfg.get('gain', 10.5) or 10.5):g} "
+        f"use_thread={bool(cam_cfg.get('use_thread', True))}"
+    )
+    if settings.detector_enabled:
+        models = config.get("models", {}) or {}
+        weights = _resolve_path(models.get("armor", "best.pt"))
+        data_yaml = _resolve_path(models.get("data_yaml", "data2_laser.yaml"))
+        print(f"detector_weights: {weights} {'EXISTS' if weights and os.path.exists(weights) else 'MISSING'}")
+        print(f"detector_data_yaml: {data_yaml} {'EXISTS' if data_yaml and os.path.exists(data_yaml) else 'MISSING'}")
+    else:
+        print("detector: disabled by --no-detector")
+    print("check finished")
+    return 0
 
 
 def save_boresight(path: str,
@@ -351,6 +562,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--no-detector", action="store_true", help="不加载 YOLO 检测器")
     parser.add_argument("--no-sync-config", action="store_true",
                         help="关闭自动同步到 config_tracking.yaml")
+    parser.add_argument("--check-config", action="store_true",
+                        help="只检查配置/路径，不打开相机")
     parser.add_argument("--step", type=int, default=2, help="初始步长(px)")
     parser.add_argument("--window-size", default="1280x720", help="显示窗口尺寸 WxH")
     args = parser.parse_args(argv)
@@ -381,6 +594,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     except OSError as exc:
         print(f"读 config 失败: {exc}")
         return 1
+
+    if args.check_config:
+        return print_config_check(config, settings)
 
     bx, by, z_ref = read_baseline(config)
     fx, fy = read_intrinsics(config)
