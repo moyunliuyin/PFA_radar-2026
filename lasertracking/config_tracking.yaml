@@ -49,7 +49,18 @@ calibration:
   baseline:
     bx: 0.02                    # 水平基线(米)，向右为正
     by: 0.0                     # 垂直基线(米)，向下为正
-    z_ref: 30.0                 # boresight 所在距离(米)，0=不使用
+    z_ref: 20.0                 # boresight 所在距离(米)，0=不使用
+  parallax_runtime:
+    enabled: true               # 运行时视差补偿总开关
+    source: 'fixed'              # auto | external | fixed | bbox_width | bbox_height | bbox_auto
+    fixed_distance_m: 20.0      # auto 且无其它距离来源时回退到该距离；当前 15~28m 场景建议先取中间值
+    # target_width_m: 0.0         # 目标真实宽度(米)，配置后可用 bbox_width/auto 估距
+    # target_height_m: 0.0        # 目标真实高度(米)，配置后可用 bbox_height/auto 估距
+    min_distance_m: 10.0        # 估计距离下限(米)
+    max_distance_m: 40.0        # 估计距离上限(米)
+    distance_alpha: 0.35        # 距离一阶低通系数，越大越跟手
+    hold_last_distance: true    # 短时丢检时沿用上次距离
+    min_bbox_px: 8.0            # 小于该框尺寸时不做 bbox 估距
 
 # 检测器参数
 detector:

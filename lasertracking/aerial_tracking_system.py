@@ -815,9 +815,28 @@ class AerialTrackingSystem:
         
         # 画面中心
         self.frame_center = None
+        self.base_aim_pixel_offset = (0.0, 0.0)  # boresight 固定补偿
         self.aim_pixel_offset = (0.0, 0.0)  # (dx,dy) 相对画面中心的固定补偿
         self.boresight_source = 'legacy'     # 'file' | 'legacy'
         self.boresight_reference = None      # dict: {u_L, v_L, image_w, image_h}
+        self.parallax_enabled = False
+        self.parallax_distance_source = 'auto'
+        self.parallax_fixed_distance_m = 0.0
+        self.parallax_target_width_m = 0.0
+        self.parallax_target_height_m = 0.0
+        self.parallax_min_distance_m = 1.0
+        self.parallax_max_distance_m = 100.0
+        self.parallax_distance_alpha = 0.35
+        self.parallax_hold_last_distance = True
+        self.parallax_min_bbox_px = 6.0
+        self.parallax_baseline_bx = 0.0
+        self.parallax_baseline_by = 0.0
+        self.parallax_z_ref = 0.0
+        self.parallax_external_distance_m = None
+        self.parallax_last_distance_m = None
+        self.parallax_last_distance_source = 'none'
+        self.parallax_last_distance_available = False
+        self.parallax_last_offset = (0.0, 0.0)
         
         # FPS计算
         self.fps_time = time.time()
@@ -1135,6 +1154,169 @@ class AerialTrackingSystem:
             )
         return (0, 0, 0, 0, 0, 0, float(self.frame_center[0]), float(self.frame_center[1]))
 
+    def configure_parallax_runtime(self,
+                                   enabled=False,
+                                   source='auto',
+                                   fixed_distance_m=0.0,
+                                   target_width_m=0.0,
+                                   target_height_m=0.0,
+                                   min_distance_m=1.0,
+                                   max_distance_m=100.0,
+                                   distance_alpha=0.35,
+                                   hold_last_distance=True,
+                                   min_bbox_px=6.0,
+                                   bx=None,
+                                   by=None,
+                                   z_ref=None):
+        """配置运行时视差补偿。"""
+        self.parallax_enabled = bool(enabled)
+        self.parallax_distance_source = str(source or 'auto').lower()
+        self.parallax_fixed_distance_m = max(0.0, float(fixed_distance_m))
+        self.parallax_target_width_m = max(0.0, float(target_width_m))
+        self.parallax_target_height_m = max(0.0, float(target_height_m))
+        self.parallax_min_distance_m = max(0.1, float(min_distance_m))
+        self.parallax_max_distance_m = max(self.parallax_min_distance_m, float(max_distance_m))
+        self.parallax_distance_alpha = min(1.0, max(0.0, float(distance_alpha)))
+        self.parallax_hold_last_distance = bool(hold_last_distance)
+        self.parallax_min_bbox_px = max(1.0, float(min_bbox_px))
+        if bx is not None:
+            self.parallax_baseline_bx = float(bx)
+        if by is not None:
+            self.parallax_baseline_by = float(by)
+        if z_ref is not None:
+            self.parallax_z_ref = float(z_ref)
+        self._update_effective_aim_pixel_offset()
+
+    def set_target_distance_m(self, distance_m):
+        """设置外部距离输入（米）。传 None/<=0 清除。"""
+        value = self._normalize_distance(distance_m)
+        self.parallax_external_distance_m = value
+        return value
+
+    def clear_target_distance_m(self):
+        """清除外部距离输入。"""
+        self.parallax_external_distance_m = None
+
+    def set_base_aim_pixel_offset(self, dx, dy):
+        """设置 boresight 基础偏移（不含距离相关视差残差）。"""
+        self.base_aim_pixel_offset = (float(dx), float(dy))
+        self._update_effective_aim_pixel_offset()
+
+    def _normalize_distance(self, distance_m):
+        try:
+            value = float(distance_m)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(value) or value <= 0.0:
+            return None
+        return min(self.parallax_max_distance_m, max(self.parallax_min_distance_m, value))
+
+    def _estimate_distance_from_bbox(self, bbox):
+        if bbox is None or len(bbox) < 4:
+            return None, 'bbox'
+        bbox_w = max(0.0, float(bbox[2]) - float(bbox[0]))
+        bbox_h = max(0.0, float(bbox[3]) - float(bbox[1]))
+        if max(bbox_w, bbox_h) < self.parallax_min_bbox_px:
+            return None, 'bbox_small'
+
+        width_distance = None
+        height_distance = None
+        if self.parallax_target_width_m > 0.0 and bbox_w >= self.parallax_min_bbox_px:
+            width_distance = self.camera_fx * self.parallax_target_width_m / bbox_w
+        if self.parallax_target_height_m > 0.0 and bbox_h >= self.parallax_min_bbox_px:
+            height_distance = self.camera_fy * self.parallax_target_height_m / bbox_h
+
+        source = self.parallax_distance_source
+        if source == 'bbox_width':
+            return self._normalize_distance(width_distance), 'bbox_w'
+        if source == 'bbox_height':
+            return self._normalize_distance(height_distance), 'bbox_h'
+
+        candidates = [v for v in (width_distance, height_distance) if v is not None]
+        if not candidates:
+            return None, 'bbox_size'
+        if len(candidates) == 1:
+            label = 'bbox_w' if width_distance is not None else 'bbox_h'
+            return self._normalize_distance(candidates[0]), label
+        return self._normalize_distance(sum(candidates) / len(candidates)), 'bbox_wh'
+
+    def _resolve_target_distance(self, laser_module=None):
+        if not self.parallax_enabled:
+            return None, 'off'
+
+        source = self.parallax_distance_source
+        bbox = None
+        if isinstance(laser_module, dict):
+            bbox = laser_module.get('bbox')
+
+        external_distance = self._normalize_distance(self.parallax_external_distance_m)
+        fixed_distance = self._normalize_distance(self.parallax_fixed_distance_m)
+
+        if source == 'external':
+            return external_distance, 'external'
+        if source == 'fixed':
+            return fixed_distance, 'fixed'
+        if source in ('bbox_width', 'bbox_height', 'bbox_auto'):
+            return self._estimate_distance_from_bbox(bbox)
+
+        if external_distance is not None:
+            return external_distance, 'external'
+        bbox_distance, bbox_source = self._estimate_distance_from_bbox(bbox)
+        if bbox_distance is not None:
+            return bbox_distance, bbox_source
+        if fixed_distance is not None:
+            return fixed_distance, 'fixed'
+        return None, 'none'
+
+    def _compute_parallax_residual(self, distance_m):
+        distance_m = self._normalize_distance(distance_m)
+        if (not self.parallax_enabled or distance_m is None or
+                (abs(self.parallax_baseline_bx) < 1e-9 and abs(self.parallax_baseline_by) < 1e-9)):
+            return 0.0, 0.0
+
+        du = self.camera_fx * self.parallax_baseline_bx / distance_m
+        dv = self.camera_fy * self.parallax_baseline_by / distance_m
+        if self.parallax_z_ref > 0.0:
+            du -= self.camera_fx * self.parallax_baseline_bx / self.parallax_z_ref
+            dv -= self.camera_fy * self.parallax_baseline_by / self.parallax_z_ref
+        return float(du), float(dv)
+
+    def _update_effective_aim_pixel_offset(self, laser_module=None):
+        distance_m, distance_source = self._resolve_target_distance(laser_module)
+        self.parallax_last_distance_available = distance_m is not None
+
+        if distance_m is not None:
+            if self.parallax_last_distance_m is None or self.parallax_distance_alpha >= 1.0:
+                smoothed = distance_m
+            elif self.parallax_distance_alpha <= 0.0:
+                smoothed = self.parallax_last_distance_m
+            else:
+                alpha = self.parallax_distance_alpha
+                smoothed = alpha * distance_m + (1.0 - alpha) * self.parallax_last_distance_m
+            self.parallax_last_distance_m = self._normalize_distance(smoothed)
+            self.parallax_last_distance_source = distance_source
+        elif not self.parallax_hold_last_distance:
+            self.parallax_last_distance_m = None
+            self.parallax_last_distance_source = distance_source
+
+        parallax_dx = 0.0
+        parallax_dy = 0.0
+        if self.parallax_last_distance_m is not None:
+            parallax_dx, parallax_dy = self._compute_parallax_residual(self.parallax_last_distance_m)
+        self.parallax_last_offset = (float(parallax_dx), float(parallax_dy))
+
+        self.aim_pixel_offset = (
+            float(self.base_aim_pixel_offset[0]) + float(parallax_dx),
+            float(self.base_aim_pixel_offset[1]) + float(parallax_dy),
+        )
+
+        if isinstance(laser_module, dict):
+            laser_module['distance_m'] = self.parallax_last_distance_m
+            laser_module['distance_source'] = self.parallax_last_distance_source
+            laser_module['parallax_dx'] = float(parallax_dx)
+            laser_module['parallax_dy'] = float(parallax_dy)
+        return self.aim_pixel_offset
+
     def _apply_left_turn_limit(self, roll_deg):
         """应用左转限位：限制 roll 最小值，防止继续向左越界。"""
         limit = getattr(self, 'left_turn_limit_roll_deg', None)
@@ -1200,6 +1382,12 @@ class AerialTrackingSystem:
         cv2.putText(frame, f"Conf: {laser_module['conf']:.2f}",
                     (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
                     (0, 255, 255), 2)
+        distance_m = laser_module.get('distance_m')
+        if distance_m is not None:
+            distance_source = laser_module.get('distance_source', 'unknown')
+            cv2.putText(frame, f"Range: {distance_m:.2f}m [{distance_source}]",
+                        (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (0, 255, 255), 2)
 
     def _draw_common_overlay(self, frame):
         """绘制公共UI：瞄准点、状态、性能信息。"""
@@ -1223,24 +1411,45 @@ class AerialTrackingSystem:
         self.fps = 1 / (current_time - self.fps_time)
         self.fps_time = current_time
 
-        cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 150),
+        cv2.putText(frame, f"FPS: {self.fps:.1f}", (10, 180),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, f"Detect: {self.detect_time*1000:.1f}ms", (10, 180),
+        cv2.putText(frame, f"Detect: {self.detect_time*1000:.1f}ms", (10, 210),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 210),
+        cv2.putText(frame, f"Device: {self.device_str.upper()}", (10, 240),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.putText(frame, "Filter: Kalman-Pred", (10, 240),
+        cv2.putText(frame, "Filter: Kalman-Pred", (10, 270),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
         pose_pitch, pose_roll = self.gimbal_pose.get_pose()
-        cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 270),
+        cv2.putText(frame, f"Gimbal: ({pose_pitch:.1f},{pose_roll:.1f})deg", (10, 300),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
         bs_src = getattr(self, 'boresight_source', 'legacy')
-        bs_u = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
-        bs_v = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
-        cv2.putText(frame, f"Boresight u={bs_u:.0f} v={bs_v:.0f} [{bs_src}]",
-                    (10, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+        base_u = float(self.frame_center[0]) + float(self.base_aim_pixel_offset[0])
+        base_v = float(self.frame_center[1]) + float(self.base_aim_pixel_offset[1])
+        aim_u = float(self.frame_center[0]) + float(self.aim_pixel_offset[0])
+        aim_v = float(self.frame_center[1]) + float(self.aim_pixel_offset[1])
+        cv2.putText(frame, f"Boresight u={base_u:.0f} v={base_v:.0f} [{bs_src}]",
+                    (10, 330), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 200, 0), 2)
+        cv2.putText(frame,
+                    f"Aim dx={self.aim_pixel_offset[0]:+.1f} dy={self.aim_pixel_offset[1]:+.1f}",
+                    (10, 360), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 220, 120), 2)
+        if self.parallax_enabled:
+            distance_text = "--"
+            if self.parallax_last_distance_m is not None:
+                distance_text = f"{self.parallax_last_distance_m:.2f}m"
+            cv2.putText(
+                frame,
+                f"Parallax d=({self.parallax_last_offset[0]:+.1f},{self.parallax_last_offset[1]:+.1f}) "
+                f"range={distance_text} [{self.parallax_last_distance_source}]",
+                (10, 390),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (0, 200, 255),
+                2,
+            )
+            cv2.putText(frame, f"Aim u={aim_u:.0f} v={aim_v:.0f}",
+                        (10, 420), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
         cv2.imshow('Laser Module Tracking System', frame)
         
@@ -1794,6 +2003,8 @@ class AerialTrackingSystem:
                             self.last_target_pos = center
                             self.target_lost_frames = 0
                             self.track_initialized = True
+
+                            self._update_effective_aim_pixel_offset(laser_module)
                         
                             # 使用装甲板中心的像素坐标（相对画面左上角）
                             pixel_x = float(center[0])
@@ -2023,6 +2234,8 @@ if __name__ == "__main__":
     CAMERA_CY = calib_cfg.get('cy', None)
     DIST_COEFFS = calib_cfg.get('dist_coeffs', None)
     ENABLE_UNDISTORT = calib_cfg.get('enable_undistort', True)
+    baseline_cfg = calib_cfg.get('baseline', {}) if isinstance(calib_cfg, dict) else {}
+    parallax_runtime_cfg = calib_cfg.get('parallax_runtime', {}) if isinstance(calib_cfg, dict) else {}
 
     # ========== 滤波器参数 ==========
     filter_cfg = config.get('filter', {})
@@ -2151,7 +2364,27 @@ if __name__ == "__main__":
             tracker.interval_enabled = fi_cfg['enabled']
         if 'interval' in fi_cfg:
             tracker.frame_interval = fi_cfg['interval']
-        
+
+        tracker.configure_parallax_runtime(
+            enabled=parallax_runtime_cfg.get('enabled', False),
+            source=parallax_runtime_cfg.get('source', 'auto'),
+            fixed_distance_m=parallax_runtime_cfg.get('fixed_distance_m', 0.0),
+            target_width_m=parallax_runtime_cfg.get('target_width_m', 0.0),
+            target_height_m=parallax_runtime_cfg.get('target_height_m', 0.0),
+            min_distance_m=parallax_runtime_cfg.get('min_distance_m', 1.0),
+            max_distance_m=parallax_runtime_cfg.get('max_distance_m', 100.0),
+            distance_alpha=parallax_runtime_cfg.get('distance_alpha', 0.35),
+            hold_last_distance=parallax_runtime_cfg.get('hold_last_distance', True),
+            min_bbox_px=parallax_runtime_cfg.get('min_bbox_px', 6.0),
+            bx=baseline_cfg.get('bx', 0.0),
+            by=baseline_cfg.get('by', 0.0),
+            z_ref=baseline_cfg.get('z_ref', 0.0),
+        )
+        print("视差补偿配置:")
+        print(f"  enabled={tracker.parallax_enabled}, source={tracker.parallax_distance_source}")
+        print(f"  baseline=({tracker.parallax_baseline_bx:.4f}, {tracker.parallax_baseline_by:.4f})m, z_ref={tracker.parallax_z_ref:g}m")
+        print(f"  fixed_distance={tracker.parallax_fixed_distance_m:.2f}m, target_size=({tracker.parallax_target_width_m:.4f}, {tracker.parallax_target_height_m:.4f})m")
+
         # 应用相机线程设置
         tracker.use_camera_thread = bool(USE_CAMERA_THREAD)
         tracker.camera.set_thread_mode(tracker.use_camera_thread)
@@ -2254,15 +2487,23 @@ if __name__ == "__main__":
                             print(f"⚠️  boresight 图像尺寸 {bs_w}x{bs_h} ≠ 当前 {cur_w}x{cur_h}，已按比例缩放")
                         dx = bs_u - cur_w * 0.5
                         dy = bs_v - cur_h * 0.5
-                        tracker.aim_pixel_offset = (float(dx), float(dy))
+                        tracker.set_base_aim_pixel_offset(float(dx), float(dy))
                         tracker.boresight_source = 'file'
                         tracker.boresight_reference = {
                             'u_L': bs_u, 'v_L': bs_v,
                             'image_w': cur_w, 'image_h': cur_h,
                             'path': boresight_path,
                         }
+                        if 'bx' in boresight_data:
+                            tracker.parallax_baseline_bx = float(boresight_data['bx'])
+                        if 'by' in boresight_data:
+                            tracker.parallax_baseline_by = float(boresight_data['by'])
+                        if 'z_ref' in boresight_data:
+                            tracker.parallax_z_ref = float(boresight_data['z_ref'])
+                        tracker._update_effective_aim_pixel_offset()
                         print(f"✓ Boresight 来源: file ({boresight_path})")
                         print(f"  u_L={bs_u:.2f} v_L={bs_v:.2f} -> dx={dx:.1f}, dy={dy:.1f}")
+                        print(f"  parallax baseline=({tracker.parallax_baseline_bx:.4f}, {tracker.parallax_baseline_by:.4f})m, z_ref={tracker.parallax_z_ref:g}m")
                         if 'z_ref' in boresight_data:
                             print(f"  校准参考距离 z_ref={float(boresight_data['z_ref']):g} m")
                         boresight_loaded = True
@@ -2277,10 +2518,10 @@ if __name__ == "__main__":
             # 像素补偿：激光点相对画面中心的固定偏差(dx,dy)
             po_cfg = config.get('pixel_offset', [0.0, 0.0])
             if isinstance(po_cfg, (list, tuple)) and len(po_cfg) >= 2:
-                tracker.aim_pixel_offset = (float(po_cfg[0]), float(po_cfg[1]))
+                tracker.set_base_aim_pixel_offset(float(po_cfg[0]), float(po_cfg[1]))
             tracker.boresight_source = 'legacy'
             print(f"✓ 像素补偿已应用 (legacy pixel_offset): "
-                  f"dx={tracker.aim_pixel_offset[0]:.1f}px, dy={tracker.aim_pixel_offset[1]:.1f}px")
+                  f"dx={tracker.base_aim_pixel_offset[0]:.1f}px, dy={tracker.base_aim_pixel_offset[1]:.1f}px")
         
         print("\n按键说明:")
         print("  k/l - 减小/增大预测时间（±20ms）")
