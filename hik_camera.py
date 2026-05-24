@@ -17,6 +17,54 @@ else:
 global img_test
 
 
+def _hik_serial_from_ubyte_array(buf):
+    s = ""
+    for per in buf:
+        if per == 0:
+            break
+        s += chr(per)
+    return s.strip()
+
+
+def hik_device_serial(mvcc_dev_info):
+    """从 MV_CC_DEVICE_INFO 解析序列号（GigE / USB3 等）。"""
+    if mvcc_dev_info.nTLayerType == MV_GIGE_DEVICE:
+        return _hik_serial_from_ubyte_array(mvcc_dev_info.SpecialInfo.stGigEInfo.chSerialNumber)
+    if mvcc_dev_info.nTLayerType == MV_USB_DEVICE:
+        return _hik_serial_from_ubyte_array(mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber)
+    return ""
+
+
+def select_hik_device_index(deviceList, serial_wanted=None, default_index=0):
+    """
+    在 MV_CC_EnumDevices 结果中选择设备下标。
+    serial_wanted 非空时按序列号匹配（不区分大小写）；为空则使用 default_index。
+    指定了序列号但未匹配到任何设备时退出进程并打印已枚举设备的序列号。
+    """
+    n = int(deviceList.nDeviceNum)
+    if n <= 0:
+        return 0
+    want = (serial_wanted or "").strip()
+    if not want:
+        idx = int(default_index)
+        if idx < 0 or idx >= n:
+            print("设备索引越界: index=%s, devices=%s" % (idx, n))
+            sys.exit(1)
+        return idx
+    want_l = want.lower()
+    for i in range(n):
+        mv = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+        sn = hik_device_serial(mv)
+        if sn.lower() == want_l:
+            print("已选择海康设备: 枚举索引=%d, 序列号=%s" % (i, sn))
+            return i
+    print("错误: 未找到序列号为 %r 的海康设备。当前枚举到的序列号:" % want)
+    for i in range(n):
+        mv = cast(deviceList.pDeviceInfo[i], POINTER(MV_CC_DEVICE_INFO)).contents
+        print("  [%d] %s" % (i, hik_device_serial(mv) or "(无/未知类型)"))
+    sys.exit(1)
+
+
 # 枚举设备
 def image_control(data, stFrameInfo):
     image = None

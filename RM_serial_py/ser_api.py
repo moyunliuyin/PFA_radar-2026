@@ -263,7 +263,7 @@ def Radar_decision(byte_data):
     # 提取第 2 位的对方双倍易伤状态
     opponent_double_vulnerability = (byte_data & 0b00000100) >> 2
 
-    # 提取第 3-4 位的己方加密等级（对方干扰波难度），开局为1，最高为3
+    # 第 3～4 位：己方加密等级（即对方干扰波难度等级），开局为 1，最高为 3；仅解析，主程序不入决策
     encryption_level = (byte_data & 0b00011000) >> 3
 
     # 提取第 5 位的密钥修改标志

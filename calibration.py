@@ -1,16 +1,44 @@
+"""
+标定程序依赖 PyQt5 与 OpenCV。若先加载了用户目录里带 Qt 的 opencv-python，
+其 cv2/qt/plugins 会抢占 xcb，导致 PyQt5 无法初始化。必须在 import cv2 之前
+指定使用 PyQt5 自带的 Qt 平台插件目录。
+"""
+import importlib.util
+import os
+import sys
+
+
+def _force_pyqt5_qt_plugin_path():
+    """将 QT_QPA_PLATFORM_PLUGIN_PATH 指向当前环境内 PyQt5/Qt5/plugins。"""
+    spec = importlib.util.find_spec("PyQt5")
+    if not spec or not spec.origin:
+        return
+    pyqt_dir = os.path.dirname(spec.origin)
+    plugins = os.path.join(pyqt_dir, "Qt5", "plugins")
+    if os.path.isdir(plugins):
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugins
+    # 避免外部 QT_PLUGIN_PATH 指向 cv2 等错误插件集
+    if "QT_PLUGIN_PATH" in os.environ:
+        del os.environ["QT_PLUGIN_PATH"]
+
+
+_force_pyqt5_qt_plugin_path()
+
 import threading
 import time
-import sys
-import os
 
 import cv2
+
+# opencv-python（非 headless）在 import 时会改写 QT_QPA_PLATFORM_PLUGIN_PATH，需再次指回 PyQt5
+_force_pyqt5_qt_plugin_path()
+
 import numpy as np
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QPixmap, QImage, QTextCursor
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QTextEdit, QGridLayout
 
 from hik_camera import call_back_get_image, start_grab_and_get_data_size, close_and_destroy_device, set_Value, \
-    get_Value, image_control
+    get_Value, image_control, hik_device_serial, select_hik_device_index
 
 if sys.platform.startswith("win"):    
     sys.path.append("./MvImport")
@@ -53,6 +81,7 @@ def hik_camera_get():
             for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName:
                 strModeName = strModeName + chr(per)
             print("device model name: %s" % strModeName)
+            print("serial number: %s" % hik_device_serial(mvcc_dev_info))
             # 输出设备ID
             nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
             nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
@@ -69,19 +98,10 @@ def hik_camera_get():
                 strModeName = strModeName + chr(per)
             print("device model name: %s" % strModeName)
 
-            strSerialNumber = ""
-            for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber:
-                if per == 0:
-                    break
-                strSerialNumber = strSerialNumber + chr(per)
+            strSerialNumber = hik_device_serial(mvcc_dev_info)
             print("user serial number: %s" % strSerialNumber)
-    # 手动选择设备
-    # nConnectionNum = input("please input the number of the device to connect:")
-    # 自动选择设备
-    nConnectionNum = '0'
-    if int(nConnectionNum) >= deviceList.nDeviceNum:
-        print("intput error!")
-        sys.exit()
+    serial_cfg = config.get('camera_params', {}).get('device_serial')
+    nConnectionNum = select_hik_device_index(deviceList, serial_wanted=serial_cfg, default_index=0)
 
     # ch:创建相机实例 | en:Creat Camera Object
     cam = MvCamera()
@@ -199,7 +219,7 @@ class MyUI(QWidget):
             right_image_path = "images-2026/red.jpg"  # 替换为右边图片的路径
         else:
             self.save_path = 'arrays_test_blue.npy'
-            right_image_path = "images-2026/map_blue.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2026/blue.jpg"  # 替换为右边图片的路径
 
         # _,left_image = self.camera_capture.read()
         left_image = camera_image

@@ -5,6 +5,7 @@
 # config
 import datetime
 import os
+import re
 import sys
 import threading
 import time
@@ -15,7 +16,7 @@ from collections import deque
 import serial
 from information_ui import draw_information_ui
 from hik_camera import call_back_get_image, start_grab_and_get_data_size, close_and_destroy_device, set_Value, \
-    get_Value, image_control
+    get_Value, image_control, hik_device_serial, select_hik_device_index
 
 if sys.platform.startswith("linux"):
     from MvImport_Linux.MvCameraControl_class import *
@@ -34,7 +35,11 @@ import yaml
 with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
     config = yaml.safe_load(f)
 
+# 本脚本作为入口运行时的时间原点（用于双倍易伤「启动窗口」等）
+main_program_start_time = time.time()
+
 state = config['global']['state']  # R:红方/B:蓝方
+multi_car_recognition = bool(config.get('global', {}).get('multi_car_recognition', True))
 assert config['filter']['type'] in ['sliding_window', 'hybrid_gated_kalman', 'hybrid'], \
     "滤波器类型必须为sliding_window/hybrid_gated_kalman/hybrid"
 if config['filter']['type'] == 'sliding_window':
@@ -57,6 +62,29 @@ else:
     ser1 = None
     print("串口功能已禁用")
 save_img = config['global']['save_img']
+SAVE_IMG_ROOT = "save_img"
+
+
+def _max_existing_game_index(save_root=SAVE_IMG_ROOT):
+    """返回 save_root 下已存在的 game{n} 目录中最大的 n，没有则为 0。"""
+    if not os.path.isdir(save_root):
+        return 0
+    best = 0
+    for name in os.listdir(save_root):
+        m = re.fullmatch(r"game(\d+)", name)
+        if m and os.path.isdir(os.path.join(save_root, name)):
+            best = max(best, int(m.group(1)))
+    return best
+
+
+def ensure_save_img_subdirs(game_index, save_root=SAVE_IMG_ROOT):
+    """确保 save_root/game{n}/1 与 /2 存在。"""
+    base = os.path.join(save_root, f"game{game_index}")
+    os.makedirs(os.path.join(base, "1"), exist_ok=True)
+    os.makedirs(os.path.join(base, "2"), exist_ok=True)
+    return base
+
+
 compare_cfg = config.get('filter_compare', {})
 compare_enabled = bool(compare_cfg.get('enabled', False))
 compare_draw = bool(compare_cfg.get('draw_on_map', True))
@@ -90,7 +118,8 @@ information_ui_show = information_ui.copy()
 double_vulnerability_chance = -1  # 双倍易伤机会数
 opponent_double_vulnerability = -1  # 是否正在触发双倍易伤
 target = -1  # 飞镖当前瞄准目标（用于触发双倍易伤）
-encryption_level = 1  # 己方加密等级（对方干扰波难度），开局为1，最高为3，来源于0x020E指令bit3-4
+# 己方加密等级（即对方干扰波难度等级），开局为1，最高为3；来自0x020E 的 bit3～4，仅解析不入决策
+encryption_level = 1
 key_modifiable = -1  # 密钥是否可修改
 chances_flag = 0  # radar_cmd当前值，开局为0，每小局重置需重启程序，触发后循环递0→1→2→0→...
 vulnerability = [-1, -1, -1, -1, -1, -1]  # 易伤情况
@@ -99,30 +128,41 @@ mark_progress_bit_cache = {i: -1 for i in range(6)}
 # 密钥相关全局变量
 current_password = generate_random_password()  # 开局生成随机密钥
 password_sent = False  # 开局密钥是否已发送
-last_encryption_level = 1  # 上一次的加密等级，用于检测等级变化（开局为1）
+# 上一帧 0x020E bit5（key_modifiable），用于边沿检测；-1 表示尚未收到有效报文
+last_key_modifiable = -1
 
 # 双倍易伤触发策略配置
-trigger_mode = config['double_vulnerability']['trigger_mode']  # 'distance', 'motion', 'both'
-print(f"双倍易伤触发模式: {trigger_mode}")
+_dv_cfg = config['double_vulnerability']
+trigger_mode = _dv_cfg['trigger_mode']  # 'distance', 'motion', 'both'
+double_vuln_stable_duration_s = float(_dv_cfg.get('stable_duration_s', 2.0))
+double_vuln_startup_window_s = float(_dv_cfg.get('startup_limit_window_s', 120.0))
+double_vuln_startup_max_uses = int(_dv_cfg.get('startup_limit_max_uses', 1))
+double_vuln_startup_uses = 0  # main 启动窗口内已成功请求双倍易伤的次数
+print(
+    f"双倍易伤触发模式: {trigger_mode}，条件稳定时长: {double_vuln_stable_duration_s}s，"
+    f"主程序启动后 {double_vuln_startup_window_s}s 内至多 {double_vuln_startup_max_uses} 次双倍易伤"
+)
 
 # 盲区预测配置
 blind_zone_enabled = bool(config.get('blind_zone', {}).get('enabled', True))
 blind_zone_roles = {'1', '2', '7'}
 
+# 距离/运动条件持续计时（需 global 在 ser_send 内更新）
+distance_condition_true_since = None
+motion_condition_true_since = None
+
 # 距离触发相关
 if trigger_mode in ['distance', 'both']:
-    distance_check_buffer = deque(maxlen=2)  # 存储最近2帧的距离判断结果
-    distance_threshold = config['double_vulnerability']['distance']['threshold']
+    distance_threshold = _dv_cfg['distance']['threshold']
 
 # 运动趋势触发相关
 if trigger_mode in ['motion', 'both']:
-    motion_check_buffer = deque(maxlen=2)  # 存储最近2帧的运动趋势判断结果
     # 记录每个机器人的位置历史（time, (x, y)）
     robot_position_history = {}
     for robot in ['R1', 'R2', 'R3', 'R4', 'R5', 'R6', 'R7', 'B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7']:
         robot_position_history[robot] = deque(maxlen=5)  # 保存最近5帧的位置和时间戳
     # 读取运动趋势相关参数
-    motion_params = config['double_vulnerability']['motion']
+    motion_params = _dv_cfg['motion']
 
 # 加载战场地图
 map = map_backup.copy()
@@ -438,6 +478,7 @@ def hik_camera_get():
             for per in mvcc_dev_info.SpecialInfo.stGigEInfo.chModelName:
                 strModeName = strModeName + chr(per)
             print("device model name: %s" % strModeName)
+            print("serial number: %s" % hik_device_serial(mvcc_dev_info))
             # 输出设备ID
             nip1 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0xff000000) >> 24)
             nip2 = ((mvcc_dev_info.SpecialInfo.stGigEInfo.nCurrentIp & 0x00ff0000) >> 16)
@@ -454,19 +495,11 @@ def hik_camera_get():
                 strModeName = strModeName + chr(per)
             print("device model name: %s" % strModeName)
 
-            strSerialNumber = ""
-            for per in mvcc_dev_info.SpecialInfo.stUsb3VInfo.chSerialNumber:
-                if per == 0:
-                    break
-                strSerialNumber = strSerialNumber + chr(per)
+            strSerialNumber = hik_device_serial(mvcc_dev_info)
             print("user serial number: %s" % strSerialNumber)
-    # 手动选择设备
-    # nConnectionNum = input("please input the number of the device to connect:")
-    # 自动选择设备
-    nConnectionNum = '0'
-    if int(nConnectionNum) >= deviceList.nDeviceNum:
-        print("intput error!")
-        sys.exit()
+    # 按 config 中的序列号选择设备；未配置则默认第一台
+    serial_cfg = config.get('camera_params', {}).get('device_serial')
+    nConnectionNum = select_hik_device_index(deviceList, serial_wanted=serial_cfg, default_index=0)
 
     # ch:创建相机实例 | en:Creat Camera Object
     cam = MvCamera()
@@ -606,7 +639,9 @@ def ser_send():
     global encryption_level
     global current_password
     global password_sent
-    global last_encryption_level
+    global last_key_modifiable
+    global distance_condition_true_since
+    global motion_condition_true_since
     # 单点预测时间
     guess_time = {
         'B1': 0,
@@ -895,6 +930,18 @@ def ser_send():
     }
     # ====== 开局发送初始密钥 ======
     key_update_time = 0  # 密钥更新发送时间戳
+    def double_vuln_startup_gate_ok():
+        if double_vuln_startup_window_s <= 0:
+            return True
+        if time.time() - main_program_start_time >= double_vuln_startup_window_s:
+            return True
+        return double_vuln_startup_uses < double_vuln_startup_max_uses
+
+    def note_double_vuln_startup_use():
+        global double_vuln_startup_uses
+        if double_vuln_startup_window_s > 0 and time.time() - main_program_start_time < double_vuln_startup_window_s:
+            double_vuln_startup_uses += 1
+
     while True:
 
         guess_time_limit = config['blind_zone']['base_time'] + config['blind_zone'][
@@ -909,7 +956,7 @@ def ser_send():
         decision_password_cmd = 0        # password_cmd: 0=无密钥操作, 1=更新己方密钥
         decision_password = [0] * 6      # 密钥值：默认全0，仅password_cmd=1时填充实际密钥
 
-        # --- 密钥更新判断 ---
+        # --- 密钥更新判断（0x0121 password_cmd=1，6 字节 ASCII 字母/数字，与 ser_api.generate_random_password 一致）---
         # 开局发送初始密钥（仅一次）
         if not password_sent:
             if key_modifiable == 1 or key_modifiable == -1:
@@ -918,16 +965,14 @@ def ser_send():
                 decision_password = current_password
                 need_send_decision = True
                 password_sent = True
-
-        # 检测加密等级变化（对方破解成功导致等级提高），更新密钥
-        if encryption_level > last_encryption_level:
-            if key_modifiable == 1:
-                current_password = generate_random_password()
-                print(f"加密等级提升({last_encryption_level}->{encryption_level})，更新密钥: {[chr(c) for c in current_password]}")
-                decision_password_cmd = 1
-                decision_password = current_password
-                need_send_decision = True
-        last_encryption_level = encryption_level
+                last_key_modifiable = key_modifiable  # 与本帧边沿逻辑对齐，避免同帧再发更新
+        # bit5=1 允许更新：自上一帧非 1 变为 1 时重新生成密钥并下发（0→1、-1→1 等，恒为 1 不重复发）
+        elif password_sent and key_modifiable == 1 and last_key_modifiable != 1:
+            current_password = generate_random_password()
+            print(f"bit5=1 更新密钥: {[chr(c) for c in current_password]}")
+            decision_password_cmd = 1
+            decision_password = current_password
+            need_send_decision = True
 
         try:
             all_filter_data = filter.get_all_data()
@@ -992,9 +1037,10 @@ def ser_send():
                 # 有双倍易伤机会，并且当前没有在双倍易伤
                 if double_vulnerability_chance > 0 and opponent_double_vulnerability == 0:
                     time_e = time.time()
-                    # 发送时间间隔为10秒
-                    if time_e - time_s > 10:
+                    # 发送时间间隔为10秒；启动窗口内双倍次数上限
+                    if time_e - time_s > 10 and double_vuln_startup_gate_ok():
                         print("飞镖触发：请求双倍易伤")
+                        note_double_vuln_startup_use()
                         chances_flag += 1
                         if chances_flag > 2:
                             chances_flag = 0
@@ -1006,17 +1052,21 @@ def ser_send():
             trigger_now = False
             trigger_method = ""
             
-            # 策略1：基于距离的触发
+            # 策略1：基于距离的触发（条件需连续满足 stable_duration_s 秒）
             if trigger_mode in ['distance', 'both']:
                 distance_trigger_now = check_distance_trigger()
-                distance_check_buffer.append(distance_trigger_now)
-                # 连续2帧都满足距离条件才触发（防止检测抖动）
-                if len(distance_check_buffer) >= 2 and all(distance_check_buffer):
-                    trigger_now = True
-                    trigger_method = "距离触发"
-                    distance_check_buffer.clear()  # 触发后清空，避免连续触发
+                now_stable = time.time()
+                if distance_trigger_now:
+                    if distance_condition_true_since is None:
+                        distance_condition_true_since = now_stable
+                    elif now_stable - distance_condition_true_since >= double_vuln_stable_duration_s:
+                        trigger_now = True
+                        trigger_method = "距离触发"
+                        distance_condition_true_since = None
+                else:
+                    distance_condition_true_since = None
             
-            # 策略2：基于运动趋势的触发
+            # 策略2：基于运动趋势的触发（条件需连续满足 stable_duration_s 秒）
             if trigger_mode in ['motion', 'both']:
                 # 更新机器人位置历史（用于运动趋势分析）
                 current_time = time.time()
@@ -1026,15 +1076,17 @@ def ser_send():
                     if pos != (0, 0) and not guess_list.get(robot_id, True):
                         robot_position_history[robot_id].append((current_time, pos))
                 
-                # 基于运动趋势的双倍易伤触发判断
                 motion_trigger_now = check_motion_trend_trigger()
-                motion_check_buffer.append(motion_trigger_now)
-                
-                # 连续2帧都满足运动趋势条件才触发（防止检测抖动）
-                if len(motion_check_buffer) >= 2 and all(motion_check_buffer):
-                    trigger_now = True
-                    trigger_method = "运动趋势触发" if trigger_method == "" else "距离+运动趋势触发"
-                    motion_check_buffer.clear()  # 触发后清空，避免连续触发
+                now_stable = time.time()
+                if motion_trigger_now:
+                    if motion_condition_true_since is None:
+                        motion_condition_true_since = now_stable
+                    elif now_stable - motion_condition_true_since >= double_vuln_stable_duration_s:
+                        trigger_now = True
+                        trigger_method = "运动趋势触发" if trigger_method == "" else "距离+运动趋势触发"
+                        motion_condition_true_since = None
+                else:
+                    motion_condition_true_since = None
             
             # 执行双倍易伤自动触发（仅设置标志，不单独发包）
             if trigger_now:
@@ -1044,8 +1096,9 @@ def ser_send():
                     # 共享10秒防抖
                     if time_e - time_s > 10:
                         # 如果飞镖触发已经设置了radar_cmd，则不重复设置
-                        if decision_radar_cmd == chances_flag:
+                        if decision_radar_cmd == chances_flag and double_vuln_startup_gate_ok():
                             print(f"[{trigger_method}] 请求双倍易伤")
+                            note_double_vuln_startup_use()
                             chances_flag += 1
                             if chances_flag > 2:
                                 chances_flag = 0
@@ -1069,6 +1122,7 @@ def ser_send():
         except Exception as r:
             print('未知错误 %s' % (r))
 
+        last_key_modifiable = key_modifiable
 
 # 裁判系统串口接收线程
 def ser_receive():
@@ -1078,7 +1132,7 @@ def ser_receive():
     global vulnerability  # 标记进度列表
     global double_vulnerability_chance  # 拥有双倍易伤次数
     global opponent_double_vulnerability  # 双倍易伤触发状态
-    global encryption_level  # 己方加密等级
+    global encryption_level  # 己方加密等级（仅解析，不参与决策）
     global key_modifiable  # 密钥是否可修改
     global target  # 飞镖当前目标
     global mark_progress_bit_cache  # 0x020C 
@@ -1179,6 +1233,7 @@ detector = YOLOv5Detector(weights_path, data='yaml/car.yaml', conf_thres=0.1, io
 detector_next = YOLOv5Detector(weights_path_next, data='yaml/armor.yaml', conf_thres=0.50, iou_thres=0.2,
                                max_det=10,
                                ui=True)
+print(f"多车同时识别: {'开启' if multi_car_recognition else '关闭（仅处理置信度最高的单车 ROI）'}")
 
 # 独立无人机检测线程（与主识别链路完全分离）
 uav_cfg = config.get('uav_thread', {}) if isinstance(config.get('uav_thread', {}), dict) else {}
@@ -1269,6 +1324,17 @@ img_y = img0.shape[0]
 img_x = img0.shape[1]
 print(img0.shape)
 
+# 内录：每次新启动主程序分配 save_img/game{N}（N = 已有 game* 最大编号 + 1），并自动创建 N/1、N/2
+save_img_game_index = _max_existing_game_index() + 1
+if save_img:
+    ensure_save_img_subdirs(save_img_game_index)
+    print(
+        "内录保存目录:",
+        os.path.join(SAVE_IMG_ROOT, f"game{save_img_game_index}", "1"),
+        "与",
+        os.path.join(SAVE_IMG_ROOT, f"game{save_img_game_index}", "2"),
+    )
+
 while True:
     # 刷新裁判系统信息UI图像
     information_ui_show = information_ui.copy()
@@ -1281,25 +1347,26 @@ while True:
     # 第一层神经网络识别
     result0 = detector.predict(img0)
     det_time += 1
+    roi_list = []
+    roi_pos = []
+    car_entries = []
     for detection in result0:
         cls, xywh, conf = detection
         if cls == 'car':
             left, top, w, h = xywh
             left, top, w, h = int(left), int(top), int(w), int(h)
-            # 存储第一次检测结果和区域
-            # ROI出机器人区域
             cropped = camera_image[top:top + h, left:left + w]
             cropped_img = np.ascontiguousarray(cropped)
-            # --- 新增：收集所有ROI ---
-            if 'roi_list' not in locals():
-                roi_list = []
-                roi_pos = []
-            roi_list.append(cropped_img)
-            roi_pos.append((left, top, w, h))
+            car_entries.append((float(conf), cropped_img, (left, top, w, h)))
+    if not multi_car_recognition and len(car_entries) > 1:
+        car_entries.sort(key=lambda x: x[0], reverse=True)
+        car_entries = car_entries[:1]
+    for _, cropped_img, pos in car_entries:
+        roi_list.append(cropped_img)
+        roi_pos.append(pos)
 
-
-    # --- 新增：拼接ROI并批量识别 ---
-    def pack_rois_to_canvas(roi_list, roi_pos, canvas_size=(160, 160), padding=10):
+    # --- 拼接ROI并批量识别 ---
+    def pack_rois_to_canvas(roi_list, roi_pos, canvas_size=(640, 640), padding=10):
         """
         将roi_list拼接到若干张canvas_size的画布上，返回画布列表和每个roi在画布中的位置
         每个ROI四周加padding，避免目标贴边
@@ -1336,7 +1403,7 @@ while True:
         return canvases, canvas_rois
 
 
-    if 'roi_list' in locals() and roi_list:
+    if roi_list:
         canvases, canvas_rois = pack_rois_to_canvas(roi_list, roi_pos, padding=10)
         # 显示所有拼接画布
         # for i, canvas in enumerate(canvases):
@@ -1416,8 +1483,6 @@ while True:
                         filter.add_data(best_cls, X_M, Y_M)
                     if compare_filter is not None:
                         compare_filter.add_data(best_cls, X_M, Y_M)
-        del roi_list
-        del roi_pos
 
     # 获取所有识别到的机器人坐标
     def project_to_map_and_serial(robot_name, xy):
@@ -1488,8 +1553,8 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
     cv2.imshow('information_ui', information_ui_show)
     map_show = cv2.resize(map, tuple(config['ui']['map_display_size']))
-    cv2.putText(map_show, "Main Filter", (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    # cv2.putText(map_show, "Main Filter", (20, 40),
+    #             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
     cv2.imshow('map_main', map_show)
     if compare_map is not None:
         map_compare_show = cv2.resize(compare_map, tuple(config['ui']['map_display_size']))
@@ -1504,8 +1569,10 @@ while True:
             uav_view_show = uav_detector.resize_for_display(uav_view, uav_window_size)
             cv2.imshow(uav_window_name, uav_view_show)
     if save_img:
-        img_name1 = "save_img/game1/1/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
-        img_name2 = "save_img/game1/2/" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
+        base = os.path.join(SAVE_IMG_ROOT, f"game{save_img_game_index}")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        img_name1 = os.path.join(base, "1", stamp + ".jpg")
+        img_name2 = os.path.join(base, "2", stamp + ".jpg")
         cv2.imwrite(img_name1, map_show)
         cv2.imwrite(img_name2, img0)
     key = cv2.waitKey(1)

@@ -41,7 +41,18 @@ class YOLOv5Detector:
         self.ui = ui
         requested_device = str(device).strip().lower() if device is not None else ''
         if requested_device in ('', 'none'):
-            requested_device = 'cpu'
+            # select_device('cpu') 会设置 CUDA_VISIBLE_DEVICES=-1，导致后续 TensorRT
+            # 无法再初始化 CUDA（.engine 会段错误），故 TensorRT 权重默认走 GPU
+            wlow = str(weights_path).lower()
+            if wlow.endswith('.engine'):
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        'TensorRT 模型 (*.engine) 需要 CUDA。当前无可用 GPU，请在 config.yaml 中改用 '
+                        'models/car.onnx 与 models/armor.onnx（或 .pt），或安装/修复 CUDA 驱动。'
+                    )
+                requested_device = '0'
+            else:
+                requested_device = 'cpu'
 
         # YOLOv5 的 select_device 常用 '0' 指代第一张GPU
         if requested_device.startswith('cuda'):

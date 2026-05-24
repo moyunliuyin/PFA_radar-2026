@@ -1,8 +1,10 @@
 global:
   state: 'B'  # 队伍颜色 R/B
-  camera_mode: 'test'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
+  camera_mode: 'hik'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
+  # 多车同时识别：true=本帧所有车 ROI 拼接批量装甲板识别；false=仅对置信度最高的一辆车走装甲板与滤波（不影响相机/串口/UI/盲区等其他逻辑）
+  multi_car_recognition: true
   use_serial: True  # 串口启用开关  保证了无串口时能正常调试，虽然没什么影响（有try）
-  save_img: False  # 是否保存图像
+  save_img: True  # 是否保存图像
   map_size: [2800, 1500]  # 战场地图尺寸
 
   test:
@@ -12,7 +14,7 @@ global:
     playback_speed: 3.0  # 播放速度（1.0=正常速度）
 
 serial: # 串口
-  port: 'COM8'
+  port: '/dev/ttyUSB0'
   baudrate: 115200
   timeout: 1
 
@@ -39,21 +41,21 @@ filter_compare:
 
 paths:
   # test_img: 'images/test1.jpg' # 测试图片
-  test_img: 'images/frame_1.jpg' # 测试图片
+  test_img: 'images/514.jpg' # 测试图片
   calibration:
     red: 'arrays_test_red.npy' # 加载标定好的仿射变换矩阵
     blue: 'arrays_test_blue.npy'
   map_images:
     red: 'images-2026/red.jpg'  # 加载红方视角地图
-    blue: 'images-2026/map_blue.jpg'
-    mask: 'images-2026/map_mask.jpg' # 加载落点判断掩码
+    blue: 'images-2026/blue.jpg'
+    mask: 'images-2026/map_mask26.jpg' # 加载落点判断掩码
     backup: 'images-2026/image_2026.jpg'
   models:
-    car: 'models/car.pt'
-    armor: 'models/armor.pt'
+    car: 'models/car.engine'
+    armor: 'models/armor.engine'
 
 uav_thread:
-  enabled: true
+  enabled: false
   model_path: 'lasertracking/aerial.pt'
   img_size: [960, 960]
   conf_thres: 0.10
@@ -77,6 +79,8 @@ uav_thread:
 camera_params:
   exposure_time: 16000.0 # 曝光时间
   gain: 17.9 # 增益值
+  # 多相机时填写目标相机序列号（与 MVS 枚举一致）；留空则默认使用枚举列表中的第一台（索引 0）
+  device_serial: 'DA1625557'
 
 blind_zone:
   enabled: true  # 盲区预测开关
@@ -92,6 +96,10 @@ blind_zone:
 
 double_vulnerability:
   trigger_mode: 'both'  # 触发策略: 'distance'(仅距离), 'motion'(仅运动趋势), 'both'(两种都启用)
+  stable_duration_s: 2.0  # 距离/运动条件需持续满足该时长(秒)才视为触发
+  # 运行 main 主程序（加载 config 后）起 startup_limit_window_s 秒内，双倍易伤至多请求 startup_limit_max_uses 次；0 表示不限制
+  startup_limit_window_s: 120.0
+  startup_limit_max_uses: 1
   distance:
     threshold: 2.5  # 距离阈值(米)
   motion:
