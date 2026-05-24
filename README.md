@@ -1,16 +1,23 @@
 # 厦门理工学院PFA战队单目相机雷达站算法开源（含机器人、装甲板识别模型）
- **没有定位模块，可以直接用哨兵（默认出生点），如下**
-
 
 
 ![img.png](images/img.png)
 
 **【2026优化】**
-
-1. 多车同时进行第二层识别
+1. 修改适应2026赛季新地图
+2. 修改了盲区预测点位
+3. 多车同时进行第二层识别，多 ROI 拼接到 canvas 进行批量推理，每个 ROI 只保留置信度最高的装甲板检测结果
+（ main.py 中 pack_rois_to_canvas 函数的 canvas_size 参数为拼接画布尺寸，减小该值可放大目标特征、提升小装甲板检出率，但大 ROI 可能被跳过；增大该值可容纳更大 ROI 但小装甲板可能漏检，可根据实际检测效果自行调整）
 ![img.png](images/cars.png)
-
-
+4. 优化卡尔曼滤波器为门控卡尔曼滤波器（HGKF），原始观测跳变门控 + 卡尔曼预测门控 （但是后期没有时间调参，还是没有调出完美参数… TT）
+5. 更新双倍易伤自主触发决策。新增 “距离触发 + 运动趋势” 触发双策略，仍然保留飞镖目标切换触发，但实际并未启用
+6. 更新裁判系统通信
+（ 0x020C--新增空中无人机易伤/特殊标识情况；
+   0x020E--加密等级/密钥修改标志
+   0x0121--密钥更新或验证指令
+   0x0305--新增己方机器人坐标发送 ）
+7. 完善内录保存功能
+8. ！！该项目仅完成识别功能，不包含反制无人机功能模块
 
 **【2025优化】**
 1. 修改适应2025RM新地图
@@ -77,9 +84,8 @@ python export.py --weights models/car.pt --include engine --device 0 --half
 python export.py --weights models/armor.pt --include engine --device 0 --half
 
 Windows：
-trtexec.exe --onnx=models/car.onnx --saveEngine=models/car.engine --fp16
-trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
-
+trtexec --onnx=models/car.onnx --saveEngine=models/car.engine --fp16 --memPoolSize=workspace:4096
+trtexec --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16 --memPoolSize=workspace:4096
 ```
 4. 修改config,改models下的.pt模型为.engine,有串口记得确保config下的use_serial为True
 
@@ -108,8 +114,6 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
 
 ```
 \---pfa_vision_radar
-    |   arrays_test_blue.npy # 蓝方测试变换矩阵
-    |   arrays_test_red.npy # 红方测试变换矩阵
     |   calibration.py # 标定部分代码
     |   config.yaml # 配置修改
     |   detect_function.py # 目标检测代码封装
@@ -119,58 +123,72 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
     |   LICENSE # 开源许可
     |   main.py # 主程序运行代码
     |   make_mask.py # 掩码绘制代码
-    |   onnx2engine.py 
+    |   onnx2engine.py # onnx转engine工具
     |   README.en.md
     |   README.md
     |   requirements.txt # 环境依赖文件
-    |   test.py # 测试代码
     |
     +---images # 需求图片文件夹
     |       calibration.JPG # 标定
+    |       cars.png # 多车识别效果
     |       image1.jpg
     |       image2.png
     |       image3.JPG
     |       image4.jpg
+    |       image6.JPG # 硬件推荐
     |       img.png
     |       map.jpg # 地图图片
     |       map_blue.jpg # 蓝方视角地图
-    |       map_mask.jpg # 地图掩码（用于透视变换高度选择）
+    |       map_mask.jpg # 地图掩码
     |       map_red.jpg # 红方视角地图
     |       map_red_s_mask.jpg
+    |       system.png # 软件框架
+    |       system1.png # 系统框架
     |       test_image.jpg # 测试鸟瞰图
-    |       全国第一.jpg 
+    |       全国第一.jpg
     |
-    +---images-2026 # 需求图片文件夹
-    |       map.jpg # 2026地图
-    |       map_blue.jpg
-    |       map_mask.jpg # 掩码地图
-    |       map_red.jpg
-    +---models
-    |   |   armor.onnx # 装甲板识别模型
+    +---images-2026 # 2026赛季地图
+    |       blue.jpg # 蓝方视角
+    |       image_2026.jpg # 地图图片
+    |       map_mask26.jpg # 掩码地图
+    |       red.jpg # 红方视角
+    |
+    +---models # 模型文件
+    |   |   armor.engine # 装甲板识别（TensorRT）
+    |   |   armor.onnx
     |   |   armor.pt
-    |   |   car.onnx # 机器人识别模型
+    |   |   car.engine # 机器人识别（TensorRT）
+    |   |   car.onnx
     |   |   car.pt
     |   |   common.py
     |   |   experimental.py
-    |   |   train_log.txt
     |   |   yolo.py
-    |   |
     |
-    +---MvImport # 海康威视相机驱动代码
+    +---MvImport # 海康相机驱动（Windows）
     |   |   CameraParams_const.py
     |   |   CameraParams_header.py
     |   |   MvCameraControl_class.py
     |   |   MvErrorDefine_const.py
     |   |   PixelType_header.py
-    |   |
     |
-    +---RM_serial_py # RM裁判系统通信代码
-    |   |   example_receive.py # 接收示例代码
-    |   |   example_send.py # 发送示例代码
-    |   |   ser_api.py # 裁判系统通信代码函数封装
-    |   |
+    +---MvImport_Linux # 海康相机驱动（Linux）
+    |   |   CameraParams_const.py
+    |   |   CameraParams_header.py
+    |   |   MvCameraControl_class.py
+    |   |   MvErrorDefine_const.py
+    |   |   PixelType_const.py
+    |   |   PixelType_header.py
     |
-    +---utils # YOLOv5目标检测工具包
+    +---raw # 测试视频存放目录
+    |
+    +---RM_serial_py # RM裁判系统通信
+    |   |   example_receive.py
+    |   |   example_send.py
+    |   |   ser_api.py
+    |
+    +---save_img # 内录图像保存
+    |
+    +---utils # YOLOv5工具包
     |   |   activations.py
     |   |   augmentations.py
     |   |   autoanchor.py
@@ -186,8 +204,7 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
     |   |   triton.py
     |   |   __init__.py
     |   |
-    |   |
-    |   +---segment
+    |   +---segment # 分割相关
     |   |   |   augmentations.py
     |   |   |   dataloaders.py
     |   |   |   general.py
@@ -195,9 +212,10 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
     |   |   |   metrics.py
     |   |   |   plots.py
     |   |   |   __init__.py
-    |   |   |
-    |   |
-    |   
+    |
+    +---yaml # 模型配置文件
+    |       armor.yaml
+    |       car.yaml
 ```
 
 
@@ -223,7 +241,7 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
 #### 注意事项
 1. 不仅可以tensorrt加速，理论上openvino也可以
 2. 可以修改多个机器人都进行盲区预测
-3. 遇到问题联系我，QQ：2460220279(现负责人) 2728615481 
+3. 遇到问题联系我，QQ：2538461760(现负责人) 2460220279 2728615481 
 4. 如果对你有帮助的话帮忙点个star
 
 #### 已知问题及解决方法
@@ -231,11 +249,4 @@ trtexec.exe --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16
 
 
 
-#### onnx转engine
-```bash
-trtexec \
---onnx=models/car.onnx \
---saveEngine=models/car.engine \
---fp16 \
---memPoolSize=workspace:4096
-```
+

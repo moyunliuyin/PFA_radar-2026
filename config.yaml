@@ -1,10 +1,10 @@
 global:
   state: 'B'  # 队伍颜色 R/B
   camera_mode: 'hik'  # 'test':测试模式,'hik':海康相机,'video':USB相机（videocapture）
-  # 多车同时识别：true=本帧所有车 ROI 拼接批量装甲板识别；false=仅对置信度最高的一辆车走装甲板与滤波（不影响相机/串口/UI/盲区等其他逻辑）
+  # 多车同时识别：true=本帧所有车 ROI 拼接批量装甲板识别；false=仅对置信度最高的一辆车走装甲板与滤波
   multi_car_recognition: true
-  use_serial: True  # 串口启用开关  保证了无串口时能正常调试，虽然没什么影响（有try）
-  save_img: True  # 是否保存图像
+  use_serial: False  # 串口启用开关  保证了无串口时能正常调试，虽然没什么影响（有try）
+  save_img: False  # 是否保存图像
   map_size: [2800, 1500]  # 战场地图尺寸
 
   test:
@@ -34,14 +34,14 @@ filter:
     measurement_noise: 1e-1
 
 filter_compare:
-  enabled: false  # true时启用影子对比滤波，不参与串口发送
+  enabled: false  # true时启用影子对比滤波，不参与串口发送,仅用于调试展示
   compare_type: 'hybrid_gated_kalman'  # auto/sliding_window/hybrid_gated_kalman
   draw_on_map: true
   show_delta_text: true
 
 paths:
   # test_img: 'images/test1.jpg' # 测试图片
-  test_img: 'images/514.jpg' # 测试图片
+  test_img: 'images/test.jpg' # 测试图片 (需要放入实际测试图片，这里并没有准备)
   calibration:
     red: 'arrays_test_red.npy' # 加载标定好的仿射变换矩阵
     blue: 'arrays_test_blue.npy'
@@ -53,28 +53,6 @@ paths:
   models:
     car: 'models/car.engine'
     armor: 'models/armor.engine'
-
-uav_thread:
-  enabled: false
-  model_path: 'lasertracking/aerial.pt'
-  img_size: [960, 960]
-  conf_thres: 0.10
-  iou_thres: 0.45
-  max_det: 6
-  process_interval_s: 0.0
-  queue_size: 2
-  right_half_only: true
-  show_window: true
-  strict_yolo26: true
-  display_size: [980, 700]
-  exposure_adapt:
-    enabled: true
-    adaptive: true
-    gamma: 1.35
-    target_brightness: 120.0
-    max_gamma: 2.2
-    clahe_clip: 2.2
-    clahe_grid: 8
 
 camera_params:
   exposure_time: 16000.0 # 曝光时间
