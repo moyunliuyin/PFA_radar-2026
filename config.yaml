@@ -91,3 +91,15 @@ ui:
   info_panel_size: [420, 500]  # 信息面板尺寸
   map_display_size: [900, 480]  # 地图显示尺寸
   img_display_size: [980, 700] # 画面显示尺寸
+
+radio:  # 解析波（无线电链路）接入；默认关闭，不影响原有视觉链路
+  enabled: False  # True 时 rader 监听 TCP，等待 combat_radar_sdr 的 jam_rx_app 进程连接
+  tcp_host: '127.0.0.1'
+  tcp_port: 5000
+  max_age_s: 3.0  # 解析波坐标有效期(秒)，超过则视为过期不使用
+  use_for_send: True  # True: 解析波坐标覆盖/补充裁判上报的敌方机器人坐标
+  draw_on_map: True  # True: 在地图上用青色叠加显示解析波坐标，便于与视觉结果对比验证
+  # 坐标方向校正：'none' / 'mirror_x' / 'mirror_y' / 'mirror_xy'
+  # 首次先用 'none' 跑通，再用地图叠加结果对比视觉坐标决定是否需要镜像
+  transform: 'none'
+  verbose: True  # 打印解析波收发日志

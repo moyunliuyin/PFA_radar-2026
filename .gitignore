@@ -107,6 +107,8 @@ celerybeat.pid
 # Environments
 .env
 .venv
+.uv-cache/
+.uv-python/
 env/
 venv/
 ENV/
@@ -136,3 +138,7 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# 解析波（无线电链路）运行产物
+radio/combat_radar_sdr/radio_logs/
+*.c64

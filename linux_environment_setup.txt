@@ -1,0 +1,188 @@
+PFA Radar + DartSystem Linux 环境安装命令
+========================================
+
+推荐系统：Ubuntu 22.04 LTS x86_64。
+
+仓库没有写死 Ubuntu 小版本，但实际环境受 Python、PyTorch、MVS SDK 和
+TensorRT 版本影响。Ubuntu 22.04 最省事：系统自带 Python 3.10，适合 DartSystem；
+PFA Radar 需要额外准备 Python 3.9。Ubuntu 20.04/24.04 也可以，但需要自行准备
+Python 3.9/3.10，并确认海康 MVS SDK 支持对应发行版。
+
+建议先确认：
+
+    cat /etc/os-release
+    uname -m
+
+
+一、公共系统依赖
+----------------
+
+    sudo apt update
+    sudo apt install -y git build-essential software-properties-common \
+      libgl1 libglib2.0-0 libxcb-cursor0 libxcb-xinerama0 \
+      libxkbcommon-x11-0 libgtk-3-0
+
+
+二、DartSystem（E:/code/visual_robot/dart 对应仓库）
+---------------------------------------------------
+
+Python 要求：3.10 或更高版本。Ubuntu 22.04 可直接使用 Python 3.10。
+
+    sudo apt install -y python3.10 python3.10-venv python3-pip \
+      ffmpeg vlc xvfb x11-utils x11-xserver-utils \
+      gstreamer1.0-libav gstreamer1.0-plugins-good \
+      gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
+      libavcodec-extra
+
+进入 DartSystem 目录后安装：
+
+    cd /path/to/dart
+    python3.10 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+
+也可以直接使用仓库提供的部署脚本；它会创建虚拟环境、安装 Python 包、检查并安装
+上面的系统依赖：
+
+    cd /path/to/dart
+    chmod +x setup_env.sh run.sh
+    ./setup_env.sh
+
+运行：
+
+    cd /path/to/dart
+    source .venv/bin/activate
+    ./run.sh
+
+海康相机模式还需要单独安装海康 MVS Linux SDK。SDK 安装完成后应存在：
+
+    /opt/MVS/lib/64/libMvCameraControl.so
+
+DartSystem 使用的环境变量：
+
+    export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+    export LD_LIBRARY_PATH=/opt/MVS/lib/64:${LD_LIBRARY_PATH:-}
+
+如需永久生效：
+
+    echo 'export MVCAM_COMMON_RUNENV=/opt/MVS/lib' >> ~/.bashrc
+    echo 'export LD_LIBRARY_PATH=/opt/MVS/lib/64:${LD_LIBRARY_PATH:-}' >> ~/.bashrc
+
+串口和相机权限：
+
+    sudo usermod -aG dialout "$USER"
+    sudo usermod -aG video "$USER"
+    sudo usermod -aG render "$USER"
+
+执行后注销并重新登录。串口设备通常为 /dev/ttyACM0 或 /dev/ttyUSB0，实际端口需要
+写入 config.yaml 的 serial.port。
+
+
+三、PFA Radar（E:/code/visual_robot/rader 对应仓库）
+------------------------------------------------------
+
+README 指定 Python 3.9。请不要使用 Python 3.13；Python 3.10 可能也能运行，但旧版
+torch、torchvision、pandas 和 onnxruntime 优先按 Python 3.9 配置。
+
+在 Ubuntu 22.04 上准备 Python 3.9：
+
+    sudo add-apt-repository -y ppa:deadsnakes/ppa
+    sudo apt update
+    sudo apt install -y python3.9 python3.9-venv python3.9-dev
+
+安装 Python 依赖：
+
+    cd /path/to/rader
+    python3.9 -m venv .venv
+    source .venv/bin/activate
+    python -m pip install --upgrade pip
+    python -m pip install -r requirements.txt
+
+要求的关键版本：
+
+    torch==1.13.1
+    torchvision==0.14.1
+    onnx==1.16.1
+    onnxruntime==1.14.1
+    numpy==1.24.4
+    opencv-python==4.5.5.64
+    PyQt5
+
+运行：
+
+    cd /path/to/rader
+    source .venv/bin/activate
+    python main.py
+
+标定：
+
+    python calibration.py
+
+PFA Radar 的 config.yaml 默认使用海康相机模式和 .engine 模型。测试 USB 相机时，
+将 global.camera_mode 改成 video；使用静态/测试模式时改成 test。串口默认关闭，
+需要通信时将 global.use_serial 改为 true，并修改 serial.port。
+
+海康相机模式需要安装 MVS Linux SDK，并设置：
+
+    export MVCAM_COMMON_RUNENV=/opt/MVS/lib
+    export LD_LIBRARY_PATH=/opt/MVS/lib/64:${LD_LIBRARY_PATH:-}
+
+确认文件存在：
+
+    test -f /opt/MVS/lib/64/libMvCameraControl.so && echo MVS-OK
+
+PFA Radar 的模型文件已经包含在仓库 models/ 中：
+
+    models/car.pt
+    models/car.onnx
+    models/car.engine
+    models/armor.pt
+    models/armor.onnx
+    models/armor.engine
+
+
+四、GPU 和 TensorRT（可选但推荐用于实时运行）
+-------------------------------------------------
+
+硬件建议：NVIDIA RTX 3060 或更高。requirements.txt 中的 PyTorch/ONNXRuntime
+版本不保证自动安装 GPU 版本；如果运行帧率很低，应安装与 NVIDIA 驱动/CUDA 匹配的
+GPU 运行时，并验证：
+
+    python -c "import torch; print(torch.__version__); print(torch.version.cuda); print(torch.cuda.is_available())"
+
+需要重新导出 TensorRT engine 时，按仓库 README 使用 TensorRT 8.6.1：
+
+    python -m pip install "tensorrt==8.6.1"
+    python export.py --weights models/armor.pt --include onnx --opset 12 --simplify
+    python export.py --weights models/car.pt --include onnx --opset 12 --simplify
+
+Linux 也可以使用仓库的 onnx2engine.py；确认 TensorRT、NVIDIA 驱动和 CUDA 版本彼此
+匹配后再执行。若只使用仓库中已有的 .engine 文件，可以跳过 TensorRT 安装。
+
+
+五、串口权限检查
+----------------
+
+    groups
+    ls -l /dev/ttyACM* /dev/ttyUSB* 2>/dev/null || true
+
+当前用户重新登录后，确认输出包含 dialout。必要时临时测试：
+
+    sudo chmod a+rw /dev/ttyACM0
+
+
+六、Ubuntu 版本结论
+-------------------
+
+没有代码层面强制要求某一个 Ubuntu 小版本。
+
+推荐：Ubuntu 22.04 LTS 64 位。
+
+原因：DartSystem 需要 Python 3.10+，PFA Radar README 指定 Python 3.9，22.04 可以
+通过 Python 3.9 额外环境同时满足两者；另外 CUDA/TensorRT/MVS SDK 在 22.04 上通常
+比更新发行版更容易匹配。
+
+Ubuntu 20.04：可以使用，但需要额外准备 Python 3.9/3.10。
+Ubuntu 24.04：理论上可以，但旧版 PyTorch 1.13.1、旧版 ONNXRuntime、MVS SDK 和
+TensorRT 8.6.1 的兼容性需要单独验证，不建议作为第一选择。

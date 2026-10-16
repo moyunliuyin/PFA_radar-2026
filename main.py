@@ -29,6 +29,7 @@ import numpy as np
 from detect_function import YOLOv5Detector
 from RM_serial_py.ser_api import build_send_packet, receive_packet, Radar_decision, \
     build_data_decision, build_data_radar_all, generate_random_password
+from radio_bridge import RadioBridge
 import yaml
 
 with open("config.yaml", "r", encoding="utf-8") as f:  # 指定 UTF-8 编码
@@ -60,6 +61,56 @@ if config['global']['use_serial']:
 else:
     ser1 = None
     print("串口功能已禁用")
+
+# ── 解析波（无线电链路）接入 ─────────────────────────────────────────────────
+# 无线电侧为 radio/combat_radar_sdr（江阴原版，未改动）；本程序监听 TCP 等其连入。
+_radio_cfg = config.get('radio', {}) or {}
+radio_enabled = bool(_radio_cfg.get('enabled', False))
+radio_use_for_send = bool(_radio_cfg.get('use_for_send', True))
+radio_draw = bool(_radio_cfg.get('draw_on_map', True))
+radio_transform = str(_radio_cfg.get('transform', 'none'))
+radio_max_age_s = float(_radio_cfg.get('max_age_s', 3.0))
+
+# 0x0A01 载荷顺序 → rader 机器人编号（解析波不含飞镖 7）
+RADIO_FIELD_TO_ROLE = {
+    'enemy_hero': '1',
+    'enemy_engineer': '2',
+    'enemy_infantry3': '3',
+    'enemy_infantry4': '4',
+    'enemy_air': '5',
+    'enemy_sentinel': '6',
+}
+
+
+def apply_radio_transform(x, y):
+    """解析波坐标方向校正。先用 'none' 跑通，再按地图叠加对比结果决定是否镜像。"""
+    if radio_transform == 'mirror_x':
+        return 2800 - x, y
+    if radio_transform == 'mirror_y':
+        return x, 1500 - y
+    if radio_transform == 'mirror_xy':
+        return 2800 - x, 1500 - y
+    return x, y
+
+
+# 解析波坐标是裁判/场地坐标系，画到地图画布需要 y 翻转
+# （与 project_to_map_and_serial 中 ser_y = 1500 - map_y 对称）
+def radio_to_map_point(x, y):
+    # 裁判/场地坐标 (x, y) → 地图画布坐标：与 ser_y = 1500 - map_y 互为逆变换
+    return int(x), int(1500 - y)
+
+
+radio_bridge = None
+if radio_enabled:
+    radio_bridge = RadioBridge(
+        host=str(_radio_cfg.get('tcp_host', '127.0.0.1')),
+        port=int(_radio_cfg.get('tcp_port', 5000)),
+        verbose=bool(_radio_cfg.get('verbose', True)),
+    )
+    if not radio_bridge.start():
+        radio_bridge = None
+        print("[radio] 解析波桥接未启动，主程序继续以纯视觉方式运行")
+
 save_img = config['global']['save_img']
 SAVE_IMG_ROOT = "save_img"
 
@@ -983,6 +1034,19 @@ def ser_send():
                 )
                 update_send_map_entry(ally_name, allow_guess=False)
 
+            # ── 解析波覆盖：用无线电解出的敌方坐标补充/覆盖视觉结果 ──
+            if radio_bridge is not None:
+                if radio_use_for_send:
+                    for _field, _p in radio_bridge.get_positions(radio_max_age_s).items():
+                        _role = RADIO_FIELD_TO_ROLE.get(_field)
+                        if _role is None:
+                            continue
+                        _rx, _ry = apply_radio_transform(_p['x'], _p['y'])
+                        if int(_rx) != 0 or int(_ry) != 0:
+                            send_map[opponent_prefix + _role] = (int(_rx), int(_ry))
+                # 按己方加密等级（0x020E bit3~4）向 SDR 下发干扰等级，便于其切换接收频点
+                radio_bridge.send_jam_level(encryption_level)
+
             ser_data = build_data_radar_all(send_map, state)
             packet, seq = build_send_packet(ser_data, seq, [0x03, 0x05])
             ser1.write(packet)
@@ -1447,6 +1511,24 @@ while True:
                 cv2.putText(map, "(" + str(ser_x) + "," + str(ser_y) + ")",
                             (point[0] - 100, point[1] + 60),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 4)
+
+    # ── 解析波坐标叠加显示（青色），用于与视觉结果对比验证 ──
+    if radio_bridge is not None and radio_draw:
+        _radio_positions = radio_bridge.get_positions(radio_max_age_s)
+        _radio_enemy_prefix = 'B' if state == 'R' else 'R'
+        for _field, _p in _radio_positions.items():
+            _role = RADIO_FIELD_TO_ROLE.get(_field)
+            if _role is None:
+                continue
+            _rx, _ry = apply_radio_transform(_p['x'], _p['y'])
+            _rpt = radio_to_map_point(_rx, _ry)
+            cv2.circle(map, _rpt, 22, (255, 255, 0), 3)
+            cv2.putText(map, _radio_enemy_prefix + _role, (_rpt[0] - 30, _rpt[1] - 28),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255, 255, 0), 4)
+        _radio_age = radio_bridge.get_positions_age()
+        if _radio_age >= 0:
+            cv2.putText(map, "radio: {} veh age={:.1f}s".format(len(_radio_positions), _radio_age),
+                        (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 0), 3)
 
     compare_map = map_backup.copy() if compare_filter is not None and compare_draw else None
     if compare_filter is not None and compare_draw and compare_filter_data:
