@@ -3,6 +3,16 @@
 
 ![img.png](images/img.png)
 
+**【2027 赛季素材】**
+1. 地图/掩码已换成 2027 赛季，素材在 `images-2027/`，底图取自官方《RoboMaster 2027 机甲大师超级对抗赛比赛规则手册 V1.0.0（20261015）》图 4-1 战场俯视渲染图
+2. 换图后**必须重新跑 `calibration.py`** 生成 `arrays_test_red.npy` / `arrays_test_blue.npy`，旧标定矩阵作废
+3. `config.yaml` 的 `blind_zone.points` 是地图像素坐标，同样失效，需重新标点
+4. `images-2027/map_mask27.png` 由 `red.jpg` 上的红/蓝描线（色度分离，`r-0.5*(g+b)>45`）逐边实测生成，不是 2026 掩码的迁移：边界坐标见 `images-2027/highland_2027.json`，可执行 `.venv\Scripts\python.exe make_mask27.py --verify` 复算，每条已绘边重测残差 ≤5 mm、笔画端点 ≤40 mm，叠加自检图见 `images-2027/mask_check_2027.png`。`--verify` 的验收值：绿占比 0.1370（57.54 m2）、恰好 3 个连通块、rot180 IoU 1.000000、已绘周长命中 0.796、已绘边逐边命中 far/inner/mid/outer = 1.000；另有两道**非自指**自检——6 个定点像素断言，以及色度归属（红半梯形四条已绘边 100% 压在红墨上、蓝墨命中 0%；蓝半镜像同理）。后者专治 y 轴翻转：`to_px()` 曾漏翻行号，使红蓝梯形互换半场，而 rot180 IoU 与周长命中率因两块互为 180 度像全部满分，只有色度能判出来。掩码只含规则规定的 3 块高地（红/蓝各 1 个梯形 + 中央高地），基地区/制高点/公路区不入掩码。`config.yaml` 的 `mask` 必须指向这个 PNG，**不要改回 JPEG**：JPEG 的 YCbCr 往返会把纯绿变成 `(1,255,0)`，而 `main.py` 以 `color[0]==color[1]==color[2]==0` 精确判黑，旧的 `map_mask27.jpg` 已实为 2026 掩码拷贝（高地占 52% 场地、面积 218 m2，与本图三条结构线无关），已改名隔离
+5. **2027-10-29 换图**：掩码与显示底图都改成用户手绘/官方导出的新版。`images-2027/map_mask27.png` 现由 `images-2027/map2027.png`（1500x2800 横版，含平涂绿 RGB(61,246,46)）取绿后 `np.rot90(...,1)` 转竖版生成，严格二值、丢 <3000 px 碎点：绿占比 **0.463019 / 194.468 m² / 1 块**（与原 3 块口径不同，`check_mask.py` 的 0.1165..0.1576 与"3 块"参照已过期，需按新图重设）。显示底图 `image_2027.png` 是 `map2027.png` 的无损拷贝（配置项从 `image_2027.jpg` 改指它；旧图备份 `image_2027.bak-2027ref.jpg`，旧掩码备份 `map_mask27.bak-2027ref.png`）。尺寸约定不变：掩码 1500x2800（宽x高）、底图 2800x1500，`main.py` 的 `map_xy = (2800 - xy[1], xy[0])` 直接可用。
+6. **2027-10-29 二次换图（手绘掩码上线，修掉那道虚线）**：`images-2027/map_mask27.png` 现由用户手绘 `images-2027/map_mask27.hand.png`（MD5 `A5744B8B31DE20C3623EC448CBE9A924`，29,052 B，**251 色**）按 `G - max(R,B) > 60` 压成严格二值后上线——只留 `(0,255,0)` / `(0,0,0)`，1,238 个 `(0,k,0)` 抗锯齿像素（k=1..5）归黑。实测：**绿占比 0.512738 / 215.350 m² / 1 块 / 内部空洞 0 个**，与 2026 掩码 IoU **0.9096**。换图原因：上一版（第 5 条）从 `map2027.png` 直接抠绿，把底图上那条斜穿高地的**白色虚线**（断口范围 x1..1391、y720..2146，每截之间间隔 3x5 px）当成"非绿"打成了 **236 个内部空洞 / 0.987 m²**，缩略图上就是用户说的「一道线」；手绘版是实心平涂，空洞归零。旧版备份 `map_mask27.bak-srcgreen.png`（30,973 B，MD5 `C759EEE19BA9AFE5746FCE0399248937`），回滚一条命令：`Copy-Item map_mask27.bak-srcgreen.png map_mask27.png -Force`。对比图 `images-2027/mask_line_fix.jpg`（全图，红点=每个断口）、`mask_line_zoom.jpg`（虚线区放大 3 倍，含底图原图对照）、页面 `mask_line_fix.html`。注意 hand 版整体比抠绿版**胖 20.88 m²**（左翼上沿抬高约 1.6 m、下沿延到 y=2498），这是手绘填上的，不是误差。
+7. **入库范围（2027-10-29）**：`images-2027/` 只提交运行必需与可追溯所需的 7 个文件——`red.jpg`、`blue.jpg`、`image_2027.png`（`map2027.png` 的无损拷贝，两者 md5 同为 `71798123AB2168A0B8D6A80E731B9746`，源图不重复入库）、`map_mask27.png`（现役掩码）、`map_mask27.hand.png`（手绘源件）、`map_mask27.bak-srcgreen.png`（上一版回滚备份）、`highland_2027.json`（`make_mask27.py` 的实测几何输入）。上面提到但**未入库**的本地产物：`map2027.png`、`mask_check_2027.png`、`map_mask27.manual.png`（纯黑空画布）、`map_mask27.bak-2027ref.png`、`mask_line_fix.jpg` / `mask_line_zoom.jpg` / `mask_line_fix.html`（虚线对比图），需要时本地重生成即可。
+
+
 **【2026优化】**
 1. ！！该项目仅完成识别功能，不包含反制无人机和解析波功能模块
 2. 修改适应2026赛季新地图
@@ -147,6 +157,15 @@ trtexec --onnx=models/armor.onnx --saveEngine=models/armor.engine --fp16 --memPo
     |       system1.png # 系统框架
     |       test_image.jpg # 测试鸟瞰图
     |       全国第一.jpg
+    |
+    +---images-2027 # 2027赛季地图（当前使用）
+    |       blue.jpg # 蓝方视角
+    |       red.jpg # 红方视角
+    |       image_2027.jpg # 地图图片
+    |       map2027.jpg # 地图横版原图
+    |       map_mask27.png # 掩码地图（make_mask27.py 实测生成，config 加载此文件）
+    |       mask_check_2027.png # 掩码叠加自检图
+    |       highland_2027.json # 掩码几何，各边实测坐标（米）
     |
     +---images-2026 # 2026赛季地图
     |       blue.jpg # 蓝方视角

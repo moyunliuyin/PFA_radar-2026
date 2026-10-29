@@ -46,10 +46,10 @@ paths:
     red: 'arrays_test_red.npy' # 加载标定好的仿射变换矩阵
     blue: 'arrays_test_blue.npy'
   map_images:
-    red: 'images-2026/red.jpg'  # 加载红方视角地图
-    blue: 'images-2026/blue.jpg'
-    mask: 'images-2026/map_mask26.jpg' # 加载落点判断掩码
-    backup: 'images-2026/image_2026.jpg'
+    red: 'images-2027/red.jpg'  # 加载红方视角地图
+    blue: 'images-2027/blue.jpg'
+    mask: 'images-2027/map_mask27.png' # 加载落点判断掩码
+    backup: 'images-2027/image_2027.png'  # 加载落点显示底图（2027 新图，无损 PNG；旧图已备份为 image_2027.bak-2027ref.jpg）
   models:
     car: 'models/car.engine'
     armor: 'models/armor.engine'

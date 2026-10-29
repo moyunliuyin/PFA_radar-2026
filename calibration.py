@@ -216,10 +216,10 @@ class MyUI(QWidget):
         self.T = []
         if self.state == 'R':
             self.save_path = 'arrays_test_red.npy'
-            right_image_path = "images-2026/red.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2027/red.jpg"  # 红方视角地图（与 config.yaml 保持一致）
         else:
             self.save_path = 'arrays_test_blue.npy'
-            right_image_path = "images-2026/blue.jpg"  # 替换为右边图片的路径
+            right_image_path = "images-2027/blue.jpg"  # 蓝方视角地图（与 config.yaml 保持一致）
 
         # _,left_image = self.camera_capture.read()
         left_image = camera_image
